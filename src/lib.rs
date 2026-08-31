@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use std::time::Duration;
 use axum::{
     extract::DefaultBodyLimit,
@@ -27,6 +27,7 @@ pub mod state;
 
 use crate::{
     error::{ApiErrorPayload, ApiErrorResponse, ApiResponse},
+    models::upload::UploadResponse,
     models::user::{
         AuthResponse, ForgetPasswordRequest, ResetPasswordRequest, SignInEmailRequest,
         SignUpEmailRequest, UserResponse, VerifyEmailRequest,
@@ -51,6 +52,7 @@ use crate::{
             ApiResponse<AuthResponse>,
             ApiResponse<UserResponse>,
             ApiResponse<OAuthUrlResponse>,
+            ApiResponse<UploadResponse>,
             ApiResponse<String>,
             SignUpEmailRequest,
             SignInEmailRequest,
@@ -59,6 +61,7 @@ use crate::{
             ResetPasswordRequest,
             AuthResponse,
             UserResponse,
+            UploadResponse,
             OAuthCallbackQuery,
             OAuthUrlResponse
         )
@@ -67,7 +70,8 @@ use crate::{
     tags(
         (name = "Observability", description = "Health and Prometheus metrics"),
         (name = "Authentication", description = "User registration, login, verification, and sessions"),
-        (name = "Social Login", description = "OAuth2 endpoints (Google, GitHub)")
+        (name = "Social Login", description = "OAuth2 endpoints (Google, GitHub)"),
+        (name = "Storage", description = "Streaming multipart file uploads & static downloads")
     )
 )]
 pub struct ApiDoc;
@@ -124,6 +128,8 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         .routes(routes!(routes::v1::auth::google_callback))
         .routes(routes!(routes::v1::auth::github_auth))
         .routes(routes!(routes::v1::auth::github_callback))
+        .routes(routes!(routes::v1::files::upload_file))
+        .routes(routes!(routes::v1::files::get_file))
         .with_state(state.clone())
         .split_for_parts();
 

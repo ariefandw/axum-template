@@ -1,4 +1,4 @@
-﻿use std::fs;
+use std::fs;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
 use utoipa_axum::routes;
@@ -21,6 +21,8 @@ fn main() {
         .routes(routes!(auth::google_callback))
         .routes(routes!(auth::github_auth))
         .routes(routes!(auth::github_callback))
+        .routes(routes!(axum_template::routes::v1::files::upload_file))
+        .routes(routes!(axum_template::routes::v1::files::get_file))
         .split_for_parts();
 
     let spec = api.to_pretty_json().expect("Failed to serialize OpenAPI spec");

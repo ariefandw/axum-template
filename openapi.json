@@ -414,6 +414,88 @@
         }
       }
     },
+    "/api/v1/files/upload": {
+      "post": {
+        "tags": [
+          "Storage"
+        ],
+        "operationId": "upload_file",
+        "responses": {
+          "201": {
+            "description": "File uploaded successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse_UploadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid file or exceeds limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/files/{filename}": {
+      "get": {
+        "tags": [
+          "Storage"
+        ],
+        "operationId": "get_file",
+        "parameters": [
+          {
+            "name": "filename",
+            "in": "path",
+            "description": "Stored filename (e.g. uuid.png)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "File contents stream",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "404": {
+            "description": "File not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/health": {
       "get": {
         "tags": [
@@ -572,6 +654,53 @@
         "properties": {
           "data": {
             "type": "string"
+          },
+          "meta": {},
+          "success": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ApiResponse_UploadResponse": {
+        "type": "object",
+        "description": "Standardized Success Envelope",
+        "required": [
+          "success",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "id",
+              "original_filename",
+              "stored_filename",
+              "content_type",
+              "size_bytes",
+              "url"
+            ],
+            "properties": {
+              "content_type": {
+                "type": "string"
+              },
+              "id": {
+                "type": "string",
+                "format": "uuid"
+              },
+              "original_filename": {
+                "type": "string"
+              },
+              "size_bytes": {
+                "type": "integer",
+                "minimum": 0
+              },
+              "stored_filename": {
+                "type": "string"
+              },
+              "url": {
+                "type": "string"
+              }
+            }
           },
           "meta": {},
           "success": {
@@ -774,6 +903,39 @@
           }
         }
       },
+      "UploadResponse": {
+        "type": "object",
+        "required": [
+          "id",
+          "original_filename",
+          "stored_filename",
+          "content_type",
+          "size_bytes",
+          "url"
+        ],
+        "properties": {
+          "content_type": {
+            "type": "string"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "original_filename": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "minimum": 0
+          },
+          "stored_filename": {
+            "type": "string"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
       "UserResponse": {
         "type": "object",
         "required": [
@@ -845,6 +1007,10 @@
     {
       "name": "Social Login",
       "description": "OAuth2 endpoints (Google, GitHub)"
+    },
+    {
+      "name": "Storage",
+      "description": "Streaming multipart file uploads & static downloads"
     }
   ]
 }

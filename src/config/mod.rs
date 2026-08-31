@@ -1,4 +1,4 @@
-﻿use std::env;
+use std::env;
 
 #[derive(Clone, Debug)]
 pub struct AppConfig {
@@ -8,6 +8,7 @@ pub struct AppConfig {
     pub database_max_connections: u32,
     pub jwt_secret: String,
     pub jwt_expiration_hours: i64,
+    pub upload_dir: String,
     pub google_client_id: Option<String>,
     pub google_client_secret: Option<String>,
     pub google_redirect_url: Option<String>,
@@ -44,6 +45,8 @@ impl AppConfig {
             .parse::<i64>()
             .map_err(|e| format!("Invalid JWT_EXPIRATION_HOURS: {e}"))?;
 
+        let upload_dir = env::var("UPLOAD_DIR").unwrap_or_else(|_| "uploads".to_string());
+
         let google_client_id = env::var("GOOGLE_CLIENT_ID").ok();
         let google_client_secret = env::var("GOOGLE_CLIENT_SECRET").ok();
         let google_redirect_url = env::var("GOOGLE_REDIRECT_URL").ok();
@@ -59,6 +62,7 @@ impl AppConfig {
             database_max_connections,
             jwt_secret,
             jwt_expiration_hours,
+            upload_dir,
             google_client_id,
             google_client_secret,
             google_redirect_url,
