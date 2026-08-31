@@ -6,6 +6,7 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
+use utoipa_axum::{router::OpenApiRouter, routes};
 use validator::Validate;
 
 use crate::{
@@ -33,7 +34,7 @@ pub struct OAuthUrlResponse {
 
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/sign-up/email",
+    path = "/sign-up/email",
     request_body = SignUpEmailRequest,
     responses(
         (status = 201, description = "User registered successfully", body = ApiResponse<AuthResponse>),
@@ -53,7 +54,7 @@ pub async fn sign_up_email(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/sign-in/email",
+    path = "/sign-in/email",
     request_body = SignInEmailRequest,
     responses(
         (status = 200, description = "Login successful", body = ApiResponse<AuthResponse>),
@@ -72,7 +73,7 @@ pub async fn sign_in_email(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/verify-email",
+    path = "/verify-email",
     request_body = VerifyEmailRequest,
     responses(
         (status = 200, description = "Email verified", body = ApiResponse<String>),
@@ -90,7 +91,7 @@ pub async fn verify_email(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/forget-password",
+    path = "/forget-password",
     request_body = ForgetPasswordRequest,
     responses(
         (status = 200, description = "Password reset initiated", body = ApiResponse<String>),
@@ -109,7 +110,7 @@ pub async fn forget_password(
 
 #[utoipa::path(
     post,
-    path = "/api/v1/auth/reset-password",
+    path = "/reset-password",
     request_body = ResetPasswordRequest,
     responses(
         (status = 200, description = "Password reset completed", body = ApiResponse<String>),
@@ -128,7 +129,7 @@ pub async fn reset_password(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/auth/get-session",
+    path = "/get-session",
     responses(
         (status = 200, description = "Current authenticated user profile", body = ApiResponse<UserResponse>),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse)
@@ -155,7 +156,7 @@ pub async fn get_session(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/auth/sign-in/social/google",
+    path = "/sign-in/social/google",
     responses(
         (status = 200, description = "Google OAuth authorization URL", body = ApiResponse<OAuthUrlResponse>),
         (status = 400, description = "Google OAuth not configured", body = ApiErrorResponse)
@@ -171,7 +172,7 @@ pub async fn google_auth(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/auth/callback/google",
+    path = "/callback/google",
     params(
         ("code" = String, Query, description = "OAuth authorization code"),
         ("state" = Option<String>, Query, description = "CSRF state token")
@@ -192,7 +193,7 @@ pub async fn google_callback(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/auth/sign-in/social/github",
+    path = "/sign-in/social/github",
     responses(
         (status = 200, description = "GitHub OAuth authorization URL", body = ApiResponse<OAuthUrlResponse>),
         (status = 400, description = "GitHub OAuth not configured", body = ApiErrorResponse)
@@ -208,7 +209,7 @@ pub async fn github_auth(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/auth/callback/github",
+    path = "/callback/github",
     params(
         ("code" = String, Query, description = "OAuth authorization code"),
         ("state" = Option<String>, Query, description = "CSRF state token")
@@ -225,4 +226,18 @@ pub async fn github_callback(
 ) -> Result<Json<ApiResponse<AuthResponse>>, AppError> {
     let res = OAuthService::handle_github_callback(&state, query.code).await?;
     Ok(Json(ApiResponse::success(res)))
+}
+
+pub fn router() -> OpenApiRouter<Arc<AppState>> {
+    OpenApiRouter::new()
+        .routes(routes!(sign_up_email))
+        .routes(routes!(sign_in_email))
+        .routes(routes!(verify_email))
+        .routes(routes!(forget_password))
+        .routes(routes!(reset_password))
+        .routes(routes!(get_session))
+        .routes(routes!(google_auth))
+        .routes(routes!(google_callback))
+        .routes(routes!(github_auth))
+        .routes(routes!(github_callback))
 }

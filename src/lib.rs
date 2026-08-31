@@ -14,7 +14,6 @@ use tower_http::{
 };
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
-use utoipa_axum::routes;
 use utoipa_scalar::{Scalar, Servable};
 
 pub mod config;
@@ -114,22 +113,9 @@ pub fn create_app(state: Arc<AppState>) -> Router {
         ])
         .allow_origin(tower_http::cors::Any);
 
-    // 2. Setup OpenAPI Routes with utoipa-axum
+    // 2. Compose Nested OpenAPI Router
     let (router, api) = OpenApiRouter::with_openapi(ApiDoc::openapi())
-        .routes(routes!(routes::health::health_check))
-        .routes(routes!(routes::health::prometheus_metrics))
-        .routes(routes!(routes::v1::auth::sign_up_email))
-        .routes(routes!(routes::v1::auth::sign_in_email))
-        .routes(routes!(routes::v1::auth::verify_email))
-        .routes(routes!(routes::v1::auth::forget_password))
-        .routes(routes!(routes::v1::auth::reset_password))
-        .routes(routes!(routes::v1::auth::get_session))
-        .routes(routes!(routes::v1::auth::google_auth))
-        .routes(routes!(routes::v1::auth::google_callback))
-        .routes(routes!(routes::v1::auth::github_auth))
-        .routes(routes!(routes::v1::auth::github_callback))
-        .routes(routes!(routes::v1::files::upload_file))
-        .routes(routes!(routes::v1::files::get_file))
+        .merge(routes::app_router())
         .with_state(state.clone())
         .split_for_parts();
 

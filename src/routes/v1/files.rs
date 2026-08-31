@@ -1,4 +1,4 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 use axum::{
     extract::{Multipart, Path, State},
     http::{header, StatusCode},
@@ -7,6 +7,7 @@ use axum::{
 };
 use tokio::fs;
 use tokio_util::io::ReaderStream;
+use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     error::{ApiErrorResponse, ApiResponse, AppError},
@@ -18,7 +19,7 @@ use crate::{
 
 #[utoipa::path(
     post,
-    path = "/api/v1/files/upload",
+    path = "/upload",
     responses(
         (status = 201, description = "File uploaded successfully", body = ApiResponse<UploadResponse>),
         (status = 400, description = "Invalid file or exceeds limit", body = ApiErrorResponse),
@@ -50,7 +51,7 @@ pub async fn upload_file(
 
 #[utoipa::path(
     get,
-    path = "/api/v1/files/{filename}",
+    path = "/{filename}",
     params(
         ("filename" = String, Path, description = "Stored filename (e.g. uuid.png)")
     ),
@@ -85,4 +86,10 @@ pub async fn get_file(
     );
 
     Ok(response)
+}
+
+pub fn router() -> OpenApiRouter<Arc<AppState>> {
+    OpenApiRouter::new()
+        .routes(routes!(upload_file))
+        .routes(routes!(get_file))
 }
