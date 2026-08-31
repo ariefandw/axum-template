@@ -1,0 +1,55 @@
+[package]
+name = "axum-template"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Web & Async
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1.43", features = ["full"] }
+tower = { version = "0.5", features = ["limit", "buffer"] }
+tower-http = { version = "0.6", features = ["cors", "trace", "request-id", "timeout", "compression-full"] }
+tower_governor = "0.6"
+
+# Serialization & Validation
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+validator = { version = "0.20", features = ["derive"] }
+
+# Database
+sqlx = { version = "0.8", features = [
+    "runtime-tokio",
+    "tls-rustls",
+    "postgres",
+    "uuid",
+    "chrono",
+    "migrate",
+] }
+
+# Security & Auth
+jsonwebtoken = "9.3"
+argon2 = { version = "0.5", features = ["std"] }
+oauth2 = "5.0"
+rand = "0.9"
+
+# Observability & Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Config & Environment
+dotenvy = "0.15"
+
+# OpenAPI & Docs
+utoipa = { version = "5.3", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-axum = "0.2"
+utoipa-scalar = { version = "0.3", features = ["axum"] }
+
+# Types & Utilities
+chrono = { version = "0.4", features = ["serde"] }
+uuid = { version = "1.13", features = ["serde", "v4", "v7"] }
+thiserror = "2.0"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+governor = "0.8"
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+bytes = "1.10"
