@@ -81,6 +81,22 @@ where
     Arc<AppState>: FromRef<S>,
 {
     let state: Arc<AppState> = FromRef::from_ref(state_ref);
+
+    // 1. Check for x-api-key header (Better Auth M2M convention)
+    if let Some(api_key) = parts.headers.get("x-api-key").and_then(|h| h.to_str().ok()) {
+        let (user, _key_record) =
+            crate::services::api_key::ApiKeyService::resolve_key(&state, api_key).await?;
+
+        return Ok(AuthUser {
+            id: user.id,
+            session_id: Uuid::nil(), // M2M API Keys use nil session
+            email: user.email,
+            role: user.role,
+            email_verified: user.email_verified,
+        });
+    }
+
+    // 2. Fall back to Bearer JWT access token
     let token = bearer_token(parts)?;
     let claims = AuthService::verify_access_token(token, state.config.jwt_secret.expose())?;
 

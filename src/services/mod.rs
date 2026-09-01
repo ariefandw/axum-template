@@ -1,3 +1,4 @@
+pub mod api_key;
 pub mod audit;
 pub mod auth;
 pub mod mail;

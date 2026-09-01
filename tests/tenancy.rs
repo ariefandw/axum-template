@@ -1,9 +1,7 @@
 mod common;
 
-use axum::http::{Request, StatusCode, header};
-use http_body_util::BodyExt;
-use serde_json::{Value, json};
-use tower::ServiceExt;
+use axum::http::StatusCode;
+use serde_json::json;
 
 use common::TestApp;
 
@@ -11,299 +9,173 @@ use common::TestApp;
 async fn outsider_cannot_create_org_in_another_users_app() {
     let app = TestApp::spawn().await;
 
-    // Register User 1 (App Owner) and User 2 (Outsider)
-    let (user1_token, _, _) = app.register("owner@test.local").await;
-    let (user2_token, _, _) = app.register("outsider@test.local").await;
+    let email1 = format!("owner_{}@test.local", uuid::Uuid::now_v7());
+    let email2 = format!("outsider_{}@test.local", uuid::Uuid::now_v7());
+
+    let (user1_token, _, _) = app.register(&email1).await;
+    let (user2_token, _, _) = app.register(&email2).await;
 
     // User 1 creates App
-    let create_app_res = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/apps")
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {user1_token}"))
-                .header("x-forwarded-for", "127.0.0.1")
-                .body(axum::body::Body::from(
-                    json!({
-                        "name": "User 1 App",
-                        "slug": "user-1-app"
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
+    let (create_status, app_json) = app
+        .post_as(
+            "/api/v1/apps",
+            json!({
+                "name": "User 1 App",
+                "slug": format!("user-app-{}", uuid::Uuid::now_v7().simple())
+            }),
+            &user1_token,
         )
-        .await
-        .unwrap();
+        .await;
 
-    assert_eq!(create_app_res.status(), StatusCode::CREATED);
-    let body = create_app_res
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
-    let app_json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(
+        create_status,
+        StatusCode::CREATED,
+        "app creation failed: {app_json}"
+    );
     let app_id = app_json["data"]["id"].as_str().unwrap();
 
     // User 2 attempts to create an Org in User 1's App -> Must be 404 Not Found (no leak)
-    let hijack_res = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/v1/apps/{app_id}/orgs"))
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {user2_token}"))
-                .header("x-forwarded-for", "127.0.0.1")
-                .body(axum::body::Body::from(
-                    json!({
-                        "name": "Hijacked Org",
-                        "slug": "hijacked-org"
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
+    let (hijack_status, _) = app
+        .post_as(
+            &format!("/api/v1/apps/{app_id}/orgs"),
+            json!({
+                "name": "Hijacked Org",
+                "slug": "hijacked-org"
+            }),
+            &user2_token,
         )
-        .await
-        .unwrap();
+        .await;
 
-    assert_eq!(hijack_res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(hijack_status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn outsider_cannot_list_another_users_app_orgs() {
     let app = TestApp::spawn().await;
 
-    let (user1_token, _, _) = app.register("appowner@test.local").await;
-    let (user2_token, _, _) = app.register("snooper@test.local").await;
+    let email1 = format!("appowner_{}@test.local", uuid::Uuid::now_v7());
+    let email2 = format!("snooper_{}@test.local", uuid::Uuid::now_v7());
+
+    let (user1_token, _, _) = app.register(&email1).await;
+    let (user2_token, _, _) = app.register(&email2).await;
 
     // User 1 creates App
-    let create_app_res = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/apps")
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {user1_token}"))
-                .header("x-forwarded-for", "127.0.0.1")
-                .body(axum::body::Body::from(
-                    json!({ "name": "Private App", "slug": "private-app" }).to_string(),
-                ))
-                .unwrap(),
+    let (status, app_json) = app
+        .post_as(
+            "/api/v1/apps",
+            json!({ "name": "Private App", "slug": format!("private-app-{}", uuid::Uuid::now_v7().simple()) }),
+            &user1_token,
         )
-        .await
-        .unwrap();
+        .await;
 
-    let body = create_app_res
-        .into_body()
-        .collect()
-        .await
-        .unwrap()
-        .to_bytes();
-    let app_json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(status, StatusCode::CREATED);
     let app_id = app_json["data"]["id"].as_str().unwrap();
 
     // User 2 attempts to list User 1's orgs -> 404 Not Found
-    let list_res = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/v1/apps/{app_id}/orgs"))
-                .method("GET")
-                .header(header::AUTHORIZATION, format!("Bearer {user2_token}"))
-                .header("x-forwarded-for", "127.0.0.1")
-                .body(axum::body::Body::empty())
-                .unwrap(),
-        )
-        .await
-        .unwrap();
+    let (list_status, _) = app
+        .get_as(&format!("/api/v1/apps/{app_id}/orgs"), &user2_token)
+        .await;
 
-    assert_eq!(list_res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(list_status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn outsider_cannot_add_members_to_an_org() {
     let app = TestApp::spawn().await;
 
-    let (user1_token, _, _) = app.register("realowner@test.local").await;
-    let (user2_token, _, _) = app.register("attacker@test.local").await;
-    let (_, _, victim_id) = app.register("victim@test.local").await;
+    let email1 = format!("realowner_{}@test.local", uuid::Uuid::now_v7());
+    let email2 = format!("attacker_{}@test.local", uuid::Uuid::now_v7());
+    let email3 = format!("victim_{}@test.local", uuid::Uuid::now_v7());
+
+    let (user1_token, _, _) = app.register(&email1).await;
+    let (user2_token, _, _) = app.register(&email2).await;
+    let (_, _, victim_id) = app.register(&email3).await;
 
     // User 1 creates App & Org
-    let app_res = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/apps")
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {user1_token}"))
-                .header("x-forwarded-for", "127.0.0.1")
-                .body(axum::body::Body::from(
-                    json!({ "name": "Target App", "slug": "target-app" }).to_string(),
-                ))
-                .unwrap(),
+    let (app_status, app_json) = app
+        .post_as(
+            "/api/v1/apps",
+            json!({ "name": "Target App", "slug": format!("target-app-{}", uuid::Uuid::now_v7().simple()) }),
+            &user1_token,
         )
-        .await
-        .unwrap();
-    let body = app_res.into_body().collect().await.unwrap().to_bytes();
-    let app_id = serde_json::from_slice::<Value>(&body).unwrap()["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+        .await;
+    assert_eq!(app_status, StatusCode::CREATED);
+    let app_id = app_json["data"]["id"].as_str().unwrap();
 
-    let org_res = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/v1/apps/{app_id}/orgs"))
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {user1_token}"))
-                .header("x-forwarded-for", "127.0.0.1")
-                .body(axum::body::Body::from(
-                    json!({ "name": "Secure Org", "slug": "secure-org" }).to_string(),
-                ))
-                .unwrap(),
+    let (org_status, org_json) = app
+        .post_as(
+            &format!("/api/v1/apps/{app_id}/orgs"),
+            json!({ "name": "Secure Org", "slug": "secure-org" }),
+            &user1_token,
         )
-        .await
-        .unwrap();
-    let body = org_res.into_body().collect().await.unwrap().to_bytes();
-    let org_id = serde_json::from_slice::<Value>(&body).unwrap()["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+        .await;
+    assert_eq!(org_status, StatusCode::CREATED);
+    let org_id = org_json["data"]["id"].as_str().unwrap();
 
     // User 2 (not in org) attempts to add a member -> 404 Not Found
-    let exploit_res = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/v1/apps/orgs/{org_id}/members"))
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {user2_token}"))
-                .header("x-forwarded-for", "127.0.0.1")
-                .body(axum::body::Body::from(
-                    json!({
-                        "user_id": victim_id,
-                        "role": "owner"
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
+    let (exploit_status, _) = app
+        .post_as(
+            &format!("/api/v1/apps/orgs/{org_id}/members"),
+            json!({
+                "user_id": victim_id,
+                "role": "owner"
+            }),
+            &user2_token,
         )
-        .await
-        .unwrap();
+        .await;
 
-    assert_eq!(exploit_res.status(), StatusCode::NOT_FOUND);
+    assert_eq!(exploit_status, StatusCode::NOT_FOUND);
 }
 
 #[tokio::test]
 async fn invalid_slug_and_role_are_rejected() {
     let app = TestApp::spawn().await;
-    let (user_token, _, _) = app.register("slugtest@test.local").await;
+    let email = format!("slugtest_{}@test.local", uuid::Uuid::now_v7());
+    let (user_token, _, _) = app.register(&email).await;
 
     // Bad Slug (uppercase and spaces)
-    let bad_slug_res = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/apps")
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
-                .header("x-forwarded-for", "127.0.0.1")
-                .body(axum::body::Body::from(
-                    json!({ "name": "Bad App", "slug": "INVALID SLUG!" }).to_string(),
-                ))
-                .unwrap(),
+    let (bad_slug_status, _) = app
+        .post_as(
+            "/api/v1/apps",
+            json!({ "name": "Bad App", "slug": "INVALID SLUG!" }),
+            &user_token,
         )
-        .await
-        .unwrap();
+        .await;
 
-    assert_eq!(bad_slug_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(bad_slug_status, StatusCode::UNPROCESSABLE_ENTITY);
 
     // Create valid app and org
-    let app_res = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri("/api/v1/apps")
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
-                .header("x-forwarded-for", "127.0.0.1")
-                .body(axum::body::Body::from(
-                    json!({ "name": "Valid App", "slug": "valid-app" }).to_string(),
-                ))
-                .unwrap(),
+    let (app_status, app_json) = app
+        .post_as(
+            "/api/v1/apps",
+            json!({ "name": "Valid App", "slug": format!("valid-app-{}", uuid::Uuid::now_v7().simple()) }),
+            &user_token,
         )
-        .await
-        .unwrap();
-    let body = app_res.into_body().collect().await.unwrap().to_bytes();
-    let app_id = serde_json::from_slice::<Value>(&body).unwrap()["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+        .await;
+    assert_eq!(app_status, StatusCode::CREATED);
+    let app_id = app_json["data"]["id"].as_str().unwrap();
 
-    let org_res = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/v1/apps/{app_id}/orgs"))
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
-                .header("x-forwarded-for", "127.0.0.1")
-                .body(axum::body::Body::from(
-                    json!({ "name": "Valid Org", "slug": "valid-org" }).to_string(),
-                ))
-                .unwrap(),
+    let (org_status, org_json) = app
+        .post_as(
+            &format!("/api/v1/apps/{app_id}/orgs"),
+            json!({ "name": "Valid Org", "slug": "valid-org" }),
+            &user_token,
         )
-        .await
-        .unwrap();
-    let body = org_res.into_body().collect().await.unwrap().to_bytes();
-    let org_id = serde_json::from_slice::<Value>(&body).unwrap()["data"]["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+        .await;
+    assert_eq!(org_status, StatusCode::CREATED);
+    let org_id = org_json["data"]["id"].as_str().unwrap();
 
     // Bad Role string ("supergod")
-    let bad_role_res = app
-        .router
-        .clone()
-        .oneshot(
-            Request::builder()
-                .uri(format!("/api/v1/apps/orgs/{org_id}/members"))
-                .method("POST")
-                .header(header::CONTENT_TYPE, "application/json")
-                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
-                .header("x-forwarded-for", "127.0.0.1")
-                .body(axum::body::Body::from(
-                    json!({
-                        "user_id": uuid::Uuid::now_v7(),
-                        "role": "supergod"
-                    })
-                    .to_string(),
-                ))
-                .unwrap(),
+    let (bad_role_status, _) = app
+        .post_as(
+            &format!("/api/v1/apps/orgs/{org_id}/members"),
+            json!({
+                "user_id": uuid::Uuid::now_v7(),
+                "role": "supergod"
+            }),
+            &user_token,
         )
-        .await
-        .unwrap();
+        .await;
 
-    assert_eq!(bad_role_res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+    assert_eq!(bad_role_status, StatusCode::UNPROCESSABLE_ENTITY);
 }
