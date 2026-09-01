@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use axum::{
     extract::{Query, State},
     Json,
@@ -7,7 +7,7 @@ use utoipa_axum::{router::OpenApiRouter, routes};
 
 use crate::{
     error::{ApiErrorResponse, ApiResponse, AppError},
-    middleware::auth::AuthUser,
+    middleware::auth::AdminUser,
     models::{
         events::AuditLog,
         pagination::{PageMeta, PageParams},
@@ -21,7 +21,8 @@ use crate::{
     params(PageParams),
     responses(
         (status = 200, description = "Paginated list of system audit logs (Admin only)", body = ApiResponse<Vec<AuditLog>>),
-        (status = 401, description = "Unauthorized", body = ApiErrorResponse)
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 403, description = "Forbidden: Admin privileges required", body = ApiErrorResponse)
     ),
     security(
         ("bearer_auth" = [])
@@ -30,7 +31,7 @@ use crate::{
 )]
 pub async fn list_audit_logs(
     State(state): State<Arc<AppState>>,
-    _auth_user: AuthUser,
+    _admin_user: AdminUser,
     Query(params): Query<PageParams>,
 ) -> Result<Json<ApiResponse<Vec<AuditLog>>>, AppError> {
     let limit = params.limit() as i64;

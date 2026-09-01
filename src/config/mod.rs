@@ -9,6 +9,9 @@ pub struct AppConfig {
     pub jwt_secret: String,
     pub jwt_expiration_hours: i64,
     pub upload_dir: String,
+    pub smtp_host: Option<String>,
+    pub smtp_port: Option<u16>,
+    pub smtp_from: Option<String>,
     pub google_client_id: Option<String>,
     pub google_client_secret: Option<String>,
     pub google_redirect_url: Option<String>,
@@ -47,6 +50,10 @@ impl AppConfig {
 
         let upload_dir = env::var("UPLOAD_DIR").unwrap_or_else(|_| "uploads".to_string());
 
+        let smtp_host = env::var("SMTP_HOST").ok();
+        let smtp_port = env::var("SMTP_PORT").ok().and_then(|p| p.parse().ok());
+        let smtp_from = env::var("SMTP_FROM").ok();
+
         let google_client_id = env::var("GOOGLE_CLIENT_ID").ok();
         let google_client_secret = env::var("GOOGLE_CLIENT_SECRET").ok();
         let google_redirect_url = env::var("GOOGLE_REDIRECT_URL").ok();
@@ -63,6 +70,9 @@ impl AppConfig {
             jwt_secret,
             jwt_expiration_hours,
             upload_dir,
+            smtp_host,
+            smtp_port,
+            smtp_from,
             google_client_id,
             google_client_secret,
             google_redirect_url,

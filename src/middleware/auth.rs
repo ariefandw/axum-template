@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use axum::{
     extract::{FromRef, FromRequestParts},
     http::{header, request::Parts},
@@ -15,6 +15,34 @@ use crate::{
 pub struct AuthUser {
     pub id: Uuid,
     pub email: String,
+    pub role: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AdminUser {
+    pub id: Uuid,
+    pub email: String,
+}
+
+impl<S> FromRequestParts<S> for AdminUser
+where
+    S: Send + Sync,
+    Arc<AppState>: FromRef<S>,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let auth_user = AuthUser::from_request_parts(parts, state).await?;
+        if auth_user.role != "admin" {
+            return Err(AppError::Forbidden(
+                "Access forbidden: admin privileges required".to_string(),
+            ));
+        }
+        Ok(AdminUser {
+            id: auth_user.id,
+            email: auth_user.email,
+        })
+    }
 }
 
 impl<S> FromRequestParts<S> for AuthUser
@@ -44,6 +72,8 @@ where
         Ok(AuthUser {
             id: user_id,
             email: claims.email,
+            role: claims.role,
         })
     }
 }
+

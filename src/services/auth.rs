@@ -162,6 +162,24 @@ impl AuthService {
         .execute(&mut *tx)
         .await?;
 
+        // 4. Send verification email via MailService (Mailpit / SMTP)
+        let config = state.config.clone();
+        let recipient = user.email.clone();
+        let token_val = verify_token.clone();
+        tokio::spawn(async move {
+            let body = format!(
+                "<h2>Welcome!</h2><p>Please verify your account using code: <b>{}</b></p>",
+                token_val
+            );
+            let _ = crate::services::mail::MailService::send_email(
+                &config,
+                &recipient,
+                "Verify your email",
+                &body,
+            )
+            .await;
+        });
+
         tx.commit().await?;
 
         tracing::info!(email = %req.email, verify_token = %verify_token, "Email verification token generated");
@@ -288,9 +306,26 @@ impl AuthService {
         .execute(&state.db)
         .await?;
 
-        tracing::info!(email = %req.email, reset_token = %reset_token, "Password reset token generated");
+        // Send reset password email via MailService (Mailpit / SMTP)
+        let config = state.config.clone();
+        let recipient = req.email.clone();
+        let token_val = reset_token.clone();
+        tokio::spawn(async move {
+            let body = format!(
+                "<h2>Password Reset Request</h2><p>Reset your password using token: <b>{}</b></p>",
+                token_val
+            );
+            let _ = crate::services::mail::MailService::send_email(
+                &config,
+                &recipient,
+                "Reset your password",
+                &body,
+            )
+            .await;
+        });
 
-        Ok("If the email exists, a password reset token has been generated".to_string())
+        tracing::info!(email = %req.email, reset_token = %reset_token, "Password reset token generated");
+        Ok("If your email is registered, you will receive a password reset token".to_string())
     }
 
     pub async fn reset_password(

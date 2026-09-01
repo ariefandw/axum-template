@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use axum::{
     extract::{Query, State},
     Json,
@@ -8,7 +8,7 @@ use validator::Validate;
 
 use crate::{
     error::{ApiErrorResponse, ApiResponse, AppError},
-    middleware::auth::AuthUser,
+    middleware::auth::{AdminUser, AuthUser},
     models::{
         pagination::{PageMeta, PageParams},
         user::{ChangePasswordRequest, UpdateUserRequest, User, UserResponse},
@@ -118,7 +118,8 @@ pub async fn delete_me(
     params(PageParams),
     responses(
         (status = 200, description = "Paginated list of users (Admin only)", body = ApiResponse<Vec<UserResponse>>),
-        (status = 401, description = "Unauthorized", body = ApiErrorResponse)
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 403, description = "Forbidden: Admin privileges required", body = ApiErrorResponse)
     ),
     security(
         ("bearer_auth" = [])
@@ -127,7 +128,7 @@ pub async fn delete_me(
 )]
 pub async fn list_users(
     State(state): State<Arc<AppState>>,
-    _auth_user: AuthUser,
+    _admin_user: AdminUser,
     Query(params): Query<PageParams>,
 ) -> Result<Json<ApiResponse<Vec<UserResponse>>>, AppError> {
     let limit = params.limit() as i64;
