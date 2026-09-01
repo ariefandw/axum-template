@@ -154,17 +154,26 @@ pub async fn get_session(
     Ok(Json(ApiResponse::success(user.into())))
 }
 
+// =========================================================================
+// Better Auth RPC-Style Aliases
+// =========================================================================
+// These endpoints provide 1-to-1 compatibility with Better Auth client SDKs
+// (e.g. @better-auth/react). They delegate directly to the underlying
+// AuthService without duplicating any business logic.
+// RESTful equivalents:
+//   - POST /update-user    <--> PATCH  /api/v1/users/me
+//   - POST /change-password <--> PATCH /api/v1/users/me/password
+//   - POST /delete-user    <--> DELETE /api/v1/users/me
+// =========================================================================
+
 #[utoipa::path(
     post,
     path = "/update-user",
     request_body = crate::models::user::UpdateUserRequest,
     responses(
-        (status = 200, description = "User profile updated (Better Auth alias)", body = ApiResponse<UserResponse>),
+        (status = 200, description = "User profile updated (Better Auth alias for PATCH /users/me)", body = ApiResponse<UserResponse>),
         (status = 400, description = "Validation error", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse)
-    ),
-    security(
-        ("bearer_auth" = [])
     ),
     tag = "Authentication"
 )]
@@ -183,12 +192,9 @@ pub async fn update_user(
     path = "/change-password",
     request_body = crate::models::user::ChangePasswordRequest,
     responses(
-        (status = 200, description = "Password changed (Better Auth alias)", body = ApiResponse<String>),
+        (status = 200, description = "Password changed (Better Auth alias for PATCH /users/me/password)", body = ApiResponse<String>),
         (status = 400, description = "Invalid password data", body = ApiErrorResponse),
         (status = 401, description = "Incorrect current password", body = ApiErrorResponse)
-    ),
-    security(
-        ("bearer_auth" = [])
     ),
     tag = "Authentication"
 )]
@@ -206,11 +212,8 @@ pub async fn change_password(
     post,
     path = "/delete-user",
     responses(
-        (status = 200, description = "Account deleted (Better Auth alias)", body = ApiResponse<String>),
+        (status = 200, description = "Account deleted (Better Auth alias for DELETE /users/me)", body = ApiResponse<String>),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse)
-    ),
-    security(
-        ("bearer_auth" = [])
     ),
     tag = "Authentication"
 )]
