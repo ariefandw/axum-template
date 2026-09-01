@@ -24,10 +24,12 @@ use uuid::Uuid;
 use crate::{
     crypto,
     error::AppError,
+    models::org::OrgRole,
     models::upload::{
         FILE_COLUMNS, FileRecord, PresignedUploadRequest, PresignedUploadResponse,
         SignedUrlResponse,
     },
+    services::org::OrgService,
     state::AppState,
 };
 
@@ -162,9 +164,16 @@ impl StorageService {
     pub async fn save_upload_field(
         state: &Arc<AppState>,
         owner_id: Uuid,
+        org_id: Option<Uuid>,
         mut field: Field<'_>,
         visibility: &str,
     ) -> Result<FileRecord, AppError> {
+        // Membership is checked before a single byte is written, so an outsider
+        // cannot use an upload to discover whether an organization exists.
+        if let Some(org_id) = org_id {
+            OrgService::require_membership(state, org_id, owner_id).await?;
+        }
+
         let original_name = sanitize_filename(field.file_name().unwrap_or("unnamed_file"));
         let file_id = Uuid::now_v7();
         let max_bytes = state.config.max_upload_bytes;
@@ -242,14 +251,15 @@ impl StorageService {
         let record = sqlx::query_as::<_, FileRecord>(&format!(
             r#"
             INSERT INTO files
-                (id, owner_id, bucket, storage_key, original_name, mime_type, size_bytes,
-                 checksum_sha256, visibility)
-            VALUES ($1, $2, 'default', $3, $4, $5, $6, $7, $8)
+                (id, owner_id, org_id, bucket, storage_key, original_name, mime_type,
+                 size_bytes, checksum_sha256, visibility)
+            VALUES ($1, $2, $3, 'default', $4, $5, $6, $7, $8, $9)
             RETURNING {FILE_COLUMNS}
             "#
         ))
         .bind(file_id)
         .bind(owner_id)
+        .bind(org_id)
         .bind(&storage_key)
         .bind(&original_name)
         .bind(mime)
@@ -271,6 +281,40 @@ impl StorageService {
 
     // -- authorized access --------------------------------------------------
 
+    /// Files belonging to one organization, newest first.
+    ///
+    /// Callers must be members; non-members are told the organization does not
+    /// exist rather than that they lack permission.
+    pub async fn list_org_files(
+        state: &Arc<AppState>,
+        org_id: Uuid,
+        viewer_id: Uuid,
+        limit: i64,
+        offset: i64,
+    ) -> Result<(Vec<FileRecord>, i64), AppError> {
+        OrgService::require_membership(state, org_id, viewer_id).await?;
+
+        let files = sqlx::query_as::<_, FileRecord>(&format!(
+            "SELECT {FILE_COLUMNS} FROM files \
+             WHERE org_id = $1 AND deleted_at IS NULL \
+             ORDER BY created_at DESC LIMIT $2 OFFSET $3"
+        ))
+        .bind(org_id)
+        .bind(limit)
+        .bind(offset)
+        .fetch_all(&state.db)
+        .await?;
+
+        let total = sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM files WHERE org_id = $1 AND deleted_at IS NULL",
+        )
+        .bind(org_id)
+        .fetch_one(&state.db)
+        .await?;
+
+        Ok((files, total))
+    }
+
     pub async fn load_record(state: &Arc<AppState>, file_id: Uuid) -> Result<FileRecord, AppError> {
         sqlx::query_as::<_, FileRecord>(&format!(
             "SELECT {FILE_COLUMNS} FROM files WHERE id = $1 AND deleted_at IS NULL"
@@ -281,34 +325,62 @@ impl StorageService {
         .ok_or_else(|| AppError::NotFound("File not found".to_string()))
     }
 
-    /// Public files are readable by anyone; private files only by their owner or
-    /// an administrator. A caller who may not read a file is told it does not
-    /// exist, so the endpoint cannot be used to probe for file IDs.
-    pub fn authorize_read(
+    /// Who may read a file.
+    ///
+    /// Public files are readable by anyone. A private file is readable by its
+    /// owner, by a platform administrator, and — when the file belongs to an
+    /// organization — by any member of that organization. Everyone else is told
+    /// it does not exist, so this cannot be used to probe for file IDs.
+    ///
+    /// The organization arm is what makes tenancy real: before it, an `org_id`
+    /// column existed on `files` but no code read it, so two tenants inside one
+    /// app had no way to share and no boundary to be separated by.
+    pub async fn authorize_read(
+        state: &Arc<AppState>,
         record: &FileRecord,
         viewer: Option<(Uuid, &str)>,
     ) -> Result<(), AppError> {
         if record.visibility == "public" {
             return Ok(());
         }
-        match viewer {
-            Some((viewer_id, role)) if Some(viewer_id) == record.owner_id || role == "admin" => {
-                Ok(())
-            }
-            _ => Err(AppError::NotFound("File not found".to_string())),
+        let Some((viewer_id, role)) = viewer else {
+            return Err(AppError::NotFound("File not found".to_string()));
+        };
+        if Some(viewer_id) == record.owner_id || role == "admin" {
+            return Ok(());
         }
+        if let Some(org_id) = record.org_id {
+            if OrgService::get_user_org_role(state, org_id, viewer_id)
+                .await?
+                .is_some()
+            {
+                return Ok(());
+            }
+        }
+        Err(AppError::NotFound("File not found".to_string()))
     }
 
-    pub fn authorize_write(
+    /// Who may delete or re-share a file: its owner, a platform administrator,
+    /// or an `admin`/`owner` of the organization it belongs to. A plain `member`
+    /// can read a tenant's files but not destroy them.
+    pub async fn authorize_write(
+        state: &Arc<AppState>,
         record: &FileRecord,
         actor_id: Uuid,
         role: &str,
     ) -> Result<(), AppError> {
         if Some(actor_id) == record.owner_id || role == "admin" {
-            Ok(())
-        } else {
-            Err(AppError::NotFound("File not found".to_string()))
+            return Ok(());
         }
+        if let Some(org_id) = record.org_id {
+            if OrgService::get_user_org_role(state, org_id, actor_id)
+                .await?
+                .is_some_and(|r| r >= OrgRole::Admin)
+            {
+                return Ok(());
+            }
+        }
+        Err(AppError::NotFound("File not found".to_string()))
     }
 
     pub async fn open_file(

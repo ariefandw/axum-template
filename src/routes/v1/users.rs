@@ -10,8 +10,9 @@ use validator::Validate;
 
 use crate::{
     error::{ApiErrorResponse, ApiResponse, AppError},
-    middleware::auth::{AdminUser, AuthUser},
+    middleware::auth::{AdminUser, AuthUser, SessionUser},
     models::{
+        api_key::ApiScope,
         pagination::{PageMeta, PageParams},
         user::{ChangePasswordRequest, USER_COLUMNS, UpdateUserRequest, User, UserResponse},
     },
@@ -43,6 +44,7 @@ pub async fn get_me(
     State(state): State<Arc<AppState>>,
     auth_user: AuthUser,
 ) -> Result<Json<ApiResponse<UserResponse>>, AppError> {
+    auth_user.require_scope(ApiScope::UsersRead)?;
     Ok(Json(ApiResponse::success(
         load_user(&state, auth_user.id).await?,
     )))
@@ -61,6 +63,7 @@ pub async fn update_me(
     auth_user: AuthUser,
     Json(payload): Json<UpdateUserRequest>,
 ) -> Result<Json<ApiResponse<UserResponse>>, AppError> {
+    auth_user.require_scope(ApiScope::UsersWrite)?;
     payload.validate()?;
     let updated = AuthService::update_profile(&state, auth_user.id, payload).await?;
     Ok(Json(ApiResponse::success(updated)))
@@ -76,14 +79,19 @@ pub async fn update_me(
 )]
 pub async fn change_password(
     State(state): State<Arc<AppState>>,
-    auth_user: AuthUser,
+    session_user: SessionUser,
     ctx: RequestContext,
     Json(payload): Json<ChangePasswordRequest>,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
     payload.validate()?;
-    let msg =
-        AuthService::change_password(&state, auth_user.id, auth_user.session_id, payload, &ctx)
-            .await?;
+    let msg = AuthService::change_password(
+        &state,
+        session_user.id,
+        session_user.session_id,
+        payload,
+        &ctx,
+    )
+    .await?;
     Ok(Json(ApiResponse::success(msg)))
 }
 
@@ -94,10 +102,10 @@ pub async fn change_password(
 )]
 pub async fn delete_me(
     State(state): State<Arc<AppState>>,
-    auth_user: AuthUser,
+    session_user: SessionUser,
     ctx: RequestContext,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
-    let msg = AuthService::delete_account(&state, auth_user.id, &ctx).await?;
+    let msg = AuthService::delete_account(&state, session_user.id, &ctx).await?;
     Ok(Json(ApiResponse::success(msg)))
 }
 

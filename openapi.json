@@ -1432,6 +1432,85 @@
         }
       }
     },
+    "/api/v1/files/org/{org_id}": {
+      "get": {
+        "tags": [
+          "Storage"
+        ],
+        "summary": "List the files belonging to an organization the caller is a member of.",
+        "operationId": "list_org_files",
+        "parameters": [
+          {
+            "name": "org_id",
+            "in": "path",
+            "description": "Organization ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "Page number (1-indexed, default: 1)",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "default": 1,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "Items per page (default: 20, max: 100)",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Files owned by the organization",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse_Vec_UploadResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Organization not found or caller is not a member",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/files/presigned-url": {
       "post": {
         "tags": [
@@ -1723,6 +1802,19 @@
                 "string",
                 "null"
               ]
+            }
+          },
+          {
+            "name": "org_id",
+            "in": "query",
+            "description": "Restrict the feed to one organization. Membership is verified, so this\ncannot be used to read a tenant you do not belong to.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
             }
           }
         ],
@@ -2708,6 +2800,13 @@
               "mime_type": {
                 "type": "string"
               },
+              "org_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid"
+              },
               "original_name": {
                 "type": "string"
               },
@@ -3019,6 +3118,14 @@
                   "type": "string",
                   "format": "uuid"
                 },
+                "org_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "uuid",
+                  "description": "Set when the notification concerns an organization rather than the\nrecipient personally."
+                },
                 "read": {
                   "type": "boolean"
                 },
@@ -3086,6 +3193,68 @@
                 "updated_at": {
                   "type": "string",
                   "format": "date-time"
+                }
+              }
+            }
+          },
+          "meta": {},
+          "success": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ApiResponse_Vec_UploadResponse": {
+        "type": "object",
+        "description": "Standardized Success Envelope",
+        "required": [
+          "success",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": [
+                "id",
+                "storage_key",
+                "original_name",
+                "size_bytes",
+                "mime_type",
+                "visibility",
+                "url"
+              ],
+              "properties": {
+                "id": {
+                  "type": "string",
+                  "format": "uuid"
+                },
+                "mime_type": {
+                  "type": "string"
+                },
+                "org_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "uuid"
+                },
+                "original_name": {
+                  "type": "string"
+                },
+                "size_bytes": {
+                  "type": "integer",
+                  "format": "int64"
+                },
+                "storage_key": {
+                  "type": "string"
+                },
+                "url": {
+                  "type": "string",
+                  "description": "Relative download path. For a private file this needs a bearer token or a\nsigned URL obtained from `/files/{id}/signed-url`."
+                },
+                "visibility": {
+                  "type": "string"
                 }
               }
             }
@@ -3499,6 +3668,14 @@
           "mime_type": {
             "type": "string"
           },
+          "org_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Owning organization, when the file belongs to a tenant rather than to an\nindividual. This column existed from the tenancy migration but was never\nread or written, so org membership granted no access to anything."
+          },
           "original_name": {
             "type": "string"
           },
@@ -3578,6 +3755,14 @@
           "id": {
             "type": "string",
             "format": "uuid"
+          },
+          "org_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Set when the notification concerns an organization rather than the\nrecipient personally."
           },
           "read": {
             "type": "boolean"
@@ -3992,6 +4177,13 @@
           },
           "mime_type": {
             "type": "string"
+          },
+          "org_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
           },
           "original_name": {
             "type": "string"

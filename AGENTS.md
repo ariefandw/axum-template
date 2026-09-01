@@ -52,7 +52,7 @@ incomplete work.
 
 ## 2. Security model
 
-The template's security rests on five decisions. Change any of them only
+The template's security rests on seven decisions. Change any of them only
 deliberately, and update the regression tests in the same commit.
 
 ### 2.1 Sessions are the source of truth, not the token
@@ -101,7 +101,43 @@ redact; the only way out is `.expose()`, which makes every disclosure greppable.
 Never log a recovery token, a rendered mail body, a session token, or a
 configuration field holding credentials. Log identifiers and event names.
 
-### 2.5 Untrusted input never picks its own bucket
+### 2.5 A machine credential is narrower than the human it belongs to
+
+An API key is not a password. It sits in CI configuration and on servers, it is
+long-lived, and it leaks in ways interactive credentials do not. Three rules keep
+a leaked key from becoming permanent control:
+
+* **Scopes are enforced, not decorative.** `Credential::require_scope` gates every
+  resource route. A key declaring `["users:read"]` cannot write. Unknown scope
+  names are rejected at creation rather than dropped, and stored scopes that
+  cannot be parsed resolve to *no* authority rather than wildcard.
+* **`*` does not include `admin`.** Reaching an administrative route needs both
+  the account's `admin` role and a key issued explicitly with the `admin` scope.
+* **Account lifecycle is closed to keys entirely, at any scope.** Changing a
+  password, deleting the account, revoking sessions, and minting further keys all
+  require `SessionUser`. Without this, revoking a leaked key is futile — the
+  attacker has already minted their own.
+
+`SessionUser` exists precisely so these routes get a real `session_id`. The
+previous implementation handed API keys `Uuid::nil()`, which matched no row and
+made session-scoped operations quietly appear to succeed.
+
+### 2.6 Tenancy reaches the data plane
+
+An organization is a boundary, not a directory entry. `files` and `notifications`
+carry `org_id`, and membership is what grants access to them:
+
+* members of an organization can read its files; non-members get `404`, not `403`
+* `admin` or `owner` is required to delete them — reading a tenant's data is not
+  the same as destroying it
+* uploading into an organization checks membership *before* any bytes are written
+* the notification feed's `org_id` filter is membership-checked, never trusted
+
+Never add a tenant-scoped table without deciding, in the same commit, which
+membership level reads it and which one writes it. A scoping column that no code
+consults is worse than none, because the next reader will trust it.
+
+### 2.7 Untrusted input never picks its own bucket
 
 `X-Forwarded-For` is honoured only when `TRUST_PROXY_HEADERS=true`, because a
 caller who chooses their apparent IP also chooses their rate-limit bucket and the
@@ -130,10 +166,10 @@ response, access token included.
 │ /api/v1/auth  │          │  /api/v1/users  │          │  /api/v1/files   │
 │ - Email auth  │          │ - /me profile   │          │ - Streaming      │
 │ - Sessions +  │          │ - /me/password  │          │   upload + sniff │
-│   refresh     │          │ - Admin list    │          │ - Signed URLs    │
-│ - OAuth+PKCE  │          │   (AdminUser)   │          │ - Owner ACLs     │
-│ - BetterAuth  │          │                 │          │                  │
-│   RPC aliases │          │                 │          │                  │
+│   refresh     │          │   (SessionUser) │          │ - Signed URLs    │
+│ - OAuth+PKCE  │          │ - Admin list    │          │ - Owner + org    │
+│ - Scoped M2M  │          │   (AdminUser)   │          │   ACLs           │
+│   API keys    │          │                 │          │ - /org/{id} list │
 └───────┬───────┘          └────────┬────────┘          └────────┬─────────┘
         └───────────────────────────┼────────────────────────────┘
                                     │
@@ -142,6 +178,7 @@ response, access token included.
 ┌──────────────────┐       ┌─────────────────┐          ┌──────────────────┐
 │ /api/v1/realtime │       │ /notifications  │          │ /api/v1/audit-   │
 │ - SSE stream     │       │ - Cursor feed   │          │   logs           │
+│                  │       │ - Org filter    │          │                  │
 │ - Cross-replica  │◀──────│ - Publishes via │          │ - Append-only    │
 │   via LISTEN/    │       │   pg_notify     │          │   (DB trigger)   │
 │   NOTIFY         │       │ - Mark read     │          │ - Admin RBAC     │
@@ -156,7 +193,10 @@ response, access token included.
                           │ oauth_requests,   │
                           │ idempotency_keys, │
                           │ notifications,    │
-                          │ audit_logs        │
+                          │ audit_logs, apps, │
+                          │ organizations,    │
+                          │ org_members,      │
+                          │ api_keys          │
                           └───────────────────┘
 ```
 
@@ -192,6 +232,16 @@ without deleting its test, and do not delete its test.
 | Signed URLs grant access and reject tampering | `signed_download_urls_grant_access_and_reject_tampering` |
 | Production refuses unsafe defaults | `config::tests::production_refuses_unsafe_defaults` |
 | The config struct is safe to log | `config::tests::debug_output_contains_no_secrets` |
+| An API key's declared scopes actually restrict it | `declared_scopes_actually_restrict_the_key` |
+| A `*` key does not reach admin routes | `wildcard_keys_do_not_include_admin` |
+| A key cannot change the password, delete the account, revoke sessions, or mint keys | `api_keys_cannot_perform_account_lifecycle_operations` |
+| An unknown scope name is rejected, not dropped | `unknown_scopes_are_rejected_at_creation` |
+| Scoping never narrows an interactive session | `sessions_are_unaffected_by_scoping` |
+| Org members can read their tenant's files | `org_members_can_read_their_organizations_files` |
+| Plain members cannot delete tenant files | `plain_members_cannot_delete_organization_files` |
+| Outsiders cannot upload into an organization | `outsiders_cannot_upload_into_an_organization` |
+| The org file listing is membership-gated | `org_file_listing_is_membership_gated` |
+| The notification org filter is membership-checked | `notification_org_filter_requires_membership` |
 
 ---
 
@@ -204,7 +254,7 @@ src/
 ├── crypto/                 # Secret wrapper, hashing, HMAC signing, AEAD at rest
 ├── error/                  # Error enum and the standard JSON envelopes
 ├── middleware/
-│   ├── auth.rs             # AuthUser / AdminUser / OptionalAuthUser / RequestContext
+│   ├── auth.rs             # Credential, AuthUser / AdminUser / SessionUser / OptionalAuthUser
 │   ├── idempotency.rs      # Scoped, Postgres-backed replay protection
 │   ├── metrics.rs          # MatchedPath route metrics + outermost outcome counter
 │   ├── rate_limit.rs       # Configurable limits and proxy-header trust
@@ -212,11 +262,13 @@ src/
 ├── models/                 # Request/response DTOs, row structs, pagination
 ├── routes/                 # health + v1/{auth,users,files,notifications,realtime,audit}
 ├── services/
+│   ├── api_key.rs          # M2M key issuance, scoped resolution, throttled last-use
 │   ├── audit.rs            # Append-only audit trail
 │   ├── auth.rs             # Argon2id, sessions, recovery tokens, lockout
 │   ├── mail.rs             # SMTP with TLS and credentials
 │   ├── notification.rs     # In-app notifications, published via pg_notify
 │   ├── oauth.rs            # OAuth2 + PKCE, server-side state validation
+│   ├── org.rs              # Apps, organizations, and OrgRole membership checks
 │   ├── realtime.rs         # LISTEN/NOTIFY bridge and publisher
 │   └── storage.rs          # StorageBackend trait, sniffing, signed URLs
 ├── state/                  # AppState (pool, config, realtime channel, metrics)
@@ -258,10 +310,14 @@ Recorded so nobody mistakes absence for oversight.
   the only implementation. Local disk does not survive container replacement and
   is invisible to other replicas, so a real deployment needs an S3 backend
   written against this trait. Signed URLs and ACLs are already backend-agnostic.
-- **Projects, teams, and a declarative permission model.** The multi-tenant
-  primitives a full backend-as-a-service offers. Ownership is currently a single
-  `owner_id` column.
-- **Server-side API keys and outbound webhooks.**
+- **A fully declarative permission model.** Apps, organizations, `OrgRole`
+  membership, and org-scoped files and notifications are implemented. What is not
+  is a general permission grammar (`read("team:x:role")` applied uniformly to
+  arbitrary resources) — authorization is currently expressed per resource in
+  code. Adding a tenant-scoped table means writing its checks explicitly.
+- **Outbound webhooks.**
+- **Per-tenant quotas, usage metering, and billing hooks.** Nothing counts or
+  caps what an organization consumes.
 - **Dynamic collections and a functions runtime.** Deliberately rejected, not
   merely absent: dynamic documents would give up the compile-time typing that is
   this template's main advantage, and a functions runtime is exactly the

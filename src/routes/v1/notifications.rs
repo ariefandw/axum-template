@@ -4,23 +4,33 @@ use axum::{
     Json,
     extract::{Path, Query, State},
 };
+use serde::Deserialize;
+use utoipa::IntoParams;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
 
 use crate::{
     error::{ApiErrorResponse, ApiResponse, AppError},
     middleware::auth::AuthUser,
+    models::api_key::ApiScope,
     models::{
         events::Notification,
         pagination::{Cursor, CursorMeta, CursorParams},
     },
-    services::notification::NotificationService,
+    services::{notification::NotificationService, org::OrgService},
     state::AppState,
 };
 
+#[derive(Debug, Deserialize, IntoParams)]
+pub struct NotificationFilter {
+    /// Restrict the feed to one organization. Membership is verified, so this
+    /// cannot be used to read a tenant you do not belong to.
+    pub org_id: Option<Uuid>,
+}
+
 /// Keyset-paginated, and scoped to the calling user by the query itself.
 #[utoipa::path(
-    get, path = "", params(CursorParams),
+    get, path = "", params(CursorParams, NotificationFilter),
     responses(
         (status = 200, description = "Notification page for the current user", body = ApiResponse<Vec<Notification>>),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse)
@@ -31,7 +41,14 @@ pub async fn list_notifications(
     State(state): State<Arc<AppState>>,
     auth_user: AuthUser,
     Query(params): Query<CursorParams>,
+    Query(filter): Query<NotificationFilter>,
 ) -> Result<Json<ApiResponse<Vec<Notification>>>, AppError> {
+    auth_user.require_scope(ApiScope::NotificationsRead)?;
+
+    if let Some(org_id) = filter.org_id {
+        OrgService::require_membership(&state, org_id, auth_user.id).await?;
+    }
+
     let limit = params.limit();
     let cursor = match params.cursor.as_deref() {
         Some(raw) => Some(
@@ -42,16 +59,18 @@ pub async fn list_notifications(
 
     let mut notifs = sqlx::query_as::<_, Notification>(
         r#"
-        SELECT id, user_id, title, body, read, data, created_at FROM notifications
+        SELECT id, user_id, org_id, title, body, read, data, created_at FROM notifications
         WHERE user_id = $1
+          AND ($4::uuid IS NULL OR org_id = $4)
           AND ($2::timestamptz IS NULL OR (created_at, id) < ($2, $3))
         ORDER BY created_at DESC, id DESC
-        LIMIT $4
+        LIMIT $5
         "#,
     )
     .bind(auth_user.id)
     .bind(cursor.map(|c| c.created_at))
     .bind(cursor.map(|c| c.id))
+    .bind(filter.org_id)
     .bind(limit as i64 + 1)
     .fetch_all(&state.db)
     .await?;
@@ -64,9 +83,11 @@ pub async fn list_notifications(
     });
 
     let unread = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM notifications WHERE user_id = $1 AND read = false",
+        "SELECT COUNT(*) FROM notifications \
+         WHERE user_id = $1 AND read = false AND ($2::uuid IS NULL OR org_id = $2)",
     )
     .bind(auth_user.id)
+    .bind(filter.org_id)
     .fetch_one(&state.db)
     .await?;
 
@@ -93,6 +114,7 @@ pub async fn mark_notification_read(
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
+    auth_user.require_scope(ApiScope::NotificationsWrite)?;
     let msg = NotificationService::mark_as_read(&state, auth_user.id, id).await?;
     Ok(Json(ApiResponse::success(msg)))
 }
@@ -106,6 +128,7 @@ pub async fn mark_all_notifications_read(
     State(state): State<Arc<AppState>>,
     auth_user: AuthUser,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
+    auth_user.require_scope(ApiScope::NotificationsWrite)?;
     let msg = NotificationService::mark_all_as_read(&state, auth_user.id).await?;
     Ok(Json(ApiResponse::success(msg)))
 }

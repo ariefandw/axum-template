@@ -16,6 +16,8 @@ use validator::Validate;
 use crate::{
     error::{ApiErrorResponse, ApiResponse, AppError},
     middleware::auth::{AuthUser, OptionalAuthUser},
+    models::api_key::ApiScope,
+    models::pagination::{PageMeta, PageParams},
     models::upload::{
         PresignedUploadRequest, PresignedUploadResponse, SignedUrlResponse, UploadResponse,
     },
@@ -48,7 +50,9 @@ pub async fn upload_file(
     ctx: RequestContext,
     mut multipart: Multipart,
 ) -> Result<(StatusCode, Json<ApiResponse<UploadResponse>>), AppError> {
+    auth_user.require_scope(ApiScope::FilesWrite)?;
     let mut visibility = String::from("private");
+    let mut org_id: Option<Uuid> = None;
 
     while let Some(field) = multipart
         .next_field()
@@ -59,10 +63,27 @@ pub async fn upload_file(
             Some("visibility") => {
                 visibility = field.text().await.unwrap_or_else(|_| "private".into());
             }
+            // Uploading into an organization requires membership, checked in the
+            // service before any bytes are written.
+            Some("org_id") => {
+                let raw = field.text().await.unwrap_or_default();
+                let trimmed = raw.trim();
+                if !trimmed.is_empty() {
+                    org_id =
+                        Some(Uuid::parse_str(trimmed).map_err(|_| {
+                            AppError::BadRequest("org_id must be a UUID".to_string())
+                        })?);
+                }
+            }
             Some("file") => {
-                let record =
-                    StorageService::save_upload_field(&state, auth_user.id, field, &visibility)
-                        .await?;
+                let record = StorageService::save_upload_field(
+                    &state,
+                    auth_user.id,
+                    org_id,
+                    field,
+                    &visibility,
+                )
+                .await?;
 
                 AuditService::record_best_effort(
                     &state,
@@ -75,6 +96,7 @@ pub async fn upload_file(
                         "mime_type": record.mime_type,
                         "size_bytes": record.size_bytes,
                         "visibility": record.visibility,
+                        "org_id": record.org_id,
                     })),
                 )
                 .await;
@@ -103,9 +125,10 @@ pub async fn upload_file(
 )]
 pub async fn create_presigned_url(
     State(state): State<Arc<AppState>>,
-    _auth_user: AuthUser,
+    auth_user: AuthUser,
     Json(payload): Json<PresignedUploadRequest>,
 ) -> Result<Json<ApiResponse<PresignedUploadResponse>>, AppError> {
+    auth_user.require_scope(ApiScope::FilesWrite)?;
     payload.validate()?;
     let res = StorageService::generate_presigned_upload(&state, &payload)?;
     Ok(Json(ApiResponse::success(res)))
@@ -125,8 +148,9 @@ pub async fn create_signed_download_url(
     auth_user: AuthUser,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<SignedUrlResponse>>, AppError> {
+    auth_user.require_scope(ApiScope::FilesRead)?;
     let record = StorageService::load_record(&state, id).await?;
-    StorageService::authorize_write(&record, auth_user.id, &auth_user.role)?;
+    StorageService::authorize_write(&state, &record, auth_user.id, &auth_user.role).await?;
     Ok(Json(ApiResponse::success(
         StorageService::generate_signed_download(&state, &record),
     )))
@@ -162,7 +186,16 @@ pub async fn get_file(
     };
 
     if !signature_ok {
-        StorageService::authorize_read(&record, viewer.as_ref().map(|v| (v.id, v.role.as_str())))?;
+        // A key-authenticated reader also needs the files:read scope.
+        if let Some(v) = viewer.as_ref() {
+            v.require_scope(ApiScope::FilesRead)?;
+        }
+        StorageService::authorize_read(
+            &state,
+            &record,
+            viewer.as_ref().map(|v| (v.id, v.role.as_str())),
+        )
+        .await?;
     }
 
     let (file, len) = StorageService::open_file(&state, &record).await?;
@@ -207,6 +240,43 @@ pub async fn get_file(
     Ok(response)
 }
 
+/// List the files belonging to an organization the caller is a member of.
+#[utoipa::path(
+    get, path = "/org/{org_id}",
+    params(
+        ("org_id" = Uuid, Path, description = "Organization ID"),
+        PageParams
+    ),
+    responses(
+        (status = 200, description = "Files owned by the organization", body = ApiResponse<Vec<UploadResponse>>),
+        (status = 404, description = "Organization not found or caller is not a member", body = ApiErrorResponse)
+    ),
+    security(("bearer_auth" = [])), tag = "Storage"
+)]
+pub async fn list_org_files(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Path(org_id): Path<Uuid>,
+    Query(params): Query<PageParams>,
+) -> Result<Json<ApiResponse<Vec<UploadResponse>>>, AppError> {
+    auth_user.require_scope(ApiScope::FilesRead)?;
+
+    let (files, total) = StorageService::list_org_files(
+        &state,
+        org_id,
+        auth_user.id,
+        params.limit() as i64,
+        params.offset() as i64,
+    )
+    .await?;
+
+    let meta = PageMeta::new(params.page(), params.page_size(), total as u64);
+    Ok(Json(ApiResponse::with_meta(
+        files.into_iter().map(Into::into).collect(),
+        serde_json::to_value(meta).unwrap_or_default(),
+    )))
+}
+
 #[utoipa::path(
     delete, path = "/{id}",
     params(("id" = Uuid, Path, description = "File ID")),
@@ -222,9 +292,10 @@ pub async fn delete_file(
     ctx: RequestContext,
     Path(id): Path<Uuid>,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
+    auth_user.require_scope(ApiScope::FilesWrite)?;
     let record = StorageService::load_record(&state, id).await?;
     // Ownership check: any authenticated caller could previously delete any file.
-    StorageService::authorize_write(&record, auth_user.id, &auth_user.role)?;
+    StorageService::authorize_write(&state, &record, auth_user.id, &auth_user.role).await?;
 
     let msg = StorageService::delete_file(&state, &record).await?;
 
@@ -247,6 +318,7 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(upload_file))
         .routes(routes!(create_presigned_url))
         .routes(routes!(create_signed_download_url))
+        .routes(routes!(list_org_files))
         .routes(routes!(get_file))
         .routes(routes!(delete_file))
 }

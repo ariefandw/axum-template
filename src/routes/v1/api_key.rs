@@ -10,7 +10,7 @@ use validator::Validate;
 
 use crate::{
     error::{ApiErrorResponse, ApiResponse, AppError},
-    middleware::auth::AuthUser,
+    middleware::auth::SessionUser,
     models::{
         api_key::{ApiKeyRecord, CreateApiKeyRequest, CreateApiKeyResponse},
         pagination::{PageMeta, PageParams},
@@ -34,13 +34,13 @@ use crate::{
     tag = "API Keys"
 )]
 pub async fn create_api_key(
-    auth_user: AuthUser,
+    session_user: SessionUser,
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateApiKeyRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<CreateApiKeyResponse>>), AppError> {
     payload.validate()?;
-    let key = ApiKeyService::create_key(&state, auth_user.id, payload, &ctx).await?;
+    let key = ApiKeyService::create_key(&state, session_user.id, payload, &ctx).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::success(key))))
 }
 
@@ -58,12 +58,12 @@ pub async fn create_api_key(
     tag = "API Keys"
 )]
 pub async fn list_api_keys(
-    auth_user: AuthUser,
+    session_user: SessionUser,
     State(state): State<Arc<AppState>>,
     Query(params): Query<PageParams>,
 ) -> Result<Json<ApiResponse<Vec<ApiKeyRecord>>>, AppError> {
     let (keys, total_count) =
-        ApiKeyService::list_keys(&state, auth_user.id, params.clone()).await?;
+        ApiKeyService::list_keys(&state, session_user.id, params.clone()).await?;
     let meta = PageMeta::new(params.page(), params.page_size(), total_count);
     Ok(Json(ApiResponse::with_meta(
         keys,
@@ -89,11 +89,11 @@ pub async fn list_api_keys(
 )]
 pub async fn delete_api_key(
     Path(key_id): Path<Uuid>,
-    auth_user: AuthUser,
+    session_user: SessionUser,
     ctx: RequestContext,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
-    ApiKeyService::delete_key(&state, key_id, auth_user.id, &ctx).await?;
+    ApiKeyService::delete_key(&state, key_id, session_user.id, &ctx).await?;
     Ok(Json(ApiResponse::success(
         "API key revoked successfully".to_string(),
     )))

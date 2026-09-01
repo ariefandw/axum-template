@@ -12,6 +12,10 @@ use validator::Validate;
 pub struct FileRecord {
     pub id: Uuid,
     pub owner_id: Option<Uuid>,
+    /// Owning organization, when the file belongs to a tenant rather than to an
+    /// individual. This column existed from the tenancy migration but was never
+    /// read or written, so org membership granted no access to anything.
+    pub org_id: Option<Uuid>,
     pub bucket: String,
     pub storage_key: String,
     pub original_name: String,
@@ -22,12 +26,13 @@ pub struct FileRecord {
     pub created_at: DateTime<Utc>,
 }
 
-pub const FILE_COLUMNS: &str = "id, owner_id, bucket, storage_key, original_name, mime_type, \
-                                size_bytes, checksum_sha256, visibility, created_at";
+pub const FILE_COLUMNS: &str = "id, owner_id, org_id, bucket, storage_key, original_name, \
+                                mime_type, size_bytes, checksum_sha256, visibility, created_at";
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UploadResponse {
     pub id: Uuid,
+    pub org_id: Option<Uuid>,
     pub storage_key: String,
     pub original_name: String,
     pub size_bytes: i64,
@@ -43,6 +48,7 @@ impl From<FileRecord> for UploadResponse {
         Self {
             url: format!("/api/v1/files/{}", f.id),
             id: f.id,
+            org_id: f.org_id,
             storage_key: f.storage_key,
             original_name: f.original_name,
             size_bytes: f.size_bytes,

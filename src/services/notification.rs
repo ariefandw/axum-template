@@ -26,15 +26,29 @@ impl NotificationService {
         body: &str,
         data: Option<serde_json::Value>,
     ) -> Result<Notification, AppError> {
+        Self::create_scoped(state, user_id, None, title, body, data).await
+    }
+
+    /// Create a notification, optionally attributed to an organization so the
+    /// recipient can separate tenant activity from personal activity.
+    pub async fn create_scoped(
+        state: &Arc<AppState>,
+        user_id: Uuid,
+        org_id: Option<Uuid>,
+        title: &str,
+        body: &str,
+        data: Option<serde_json::Value>,
+    ) -> Result<Notification, AppError> {
         let notif = sqlx::query_as::<_, Notification>(
             r#"
-            INSERT INTO notifications (id, user_id, title, body, read, data)
-            VALUES ($1, $2, $3, $4, false, $5)
-            RETURNING id, user_id, title, body, read, data, created_at
+            INSERT INTO notifications (id, user_id, org_id, title, body, read, data)
+            VALUES ($1, $2, $3, $4, $5, false, $6)
+            RETURNING id, user_id, org_id, title, body, read, data, created_at
             "#,
         )
         .bind(Uuid::now_v7())
         .bind(user_id)
+        .bind(org_id)
         .bind(title)
         .bind(body)
         .bind(&data)

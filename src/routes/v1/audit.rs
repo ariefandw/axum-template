@@ -12,6 +12,7 @@ use uuid::Uuid;
 use crate::{
     error::{ApiErrorResponse, ApiResponse, AppError},
     middleware::auth::AdminUser,
+    models::api_key::ApiScope,
     models::{
         events::AuditLog,
         pagination::{Cursor, CursorMeta, CursorParams},
@@ -42,10 +43,11 @@ pub struct AuditFilter {
 )]
 pub async fn list_audit_logs(
     State(state): State<Arc<AppState>>,
-    _admin_user: AdminUser,
+    admin_user: AdminUser,
     Query(params): Query<CursorParams>,
     Query(filter): Query<AuditFilter>,
 ) -> Result<Json<ApiResponse<Vec<AuditLog>>>, AppError> {
+    admin_user.require_scope(ApiScope::AuditRead)?;
     let limit = params.limit();
     let cursor = match params.cursor.as_deref() {
         Some(raw) => Some(

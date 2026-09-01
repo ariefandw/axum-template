@@ -12,7 +12,7 @@ use validator::Validate;
 
 use crate::{
     error::{ApiErrorResponse, ApiResponse, AppError},
-    middleware::auth::AuthUser,
+    middleware::auth::{AuthUser, SessionUser},
     models::user::{
         AuthResponse, ChangePasswordRequest, ForgetPasswordRequest, RefreshTokenRequest,
         ResetPasswordRequest, SignInEmailRequest, SignUpEmailRequest, UpdateUserRequest,
@@ -102,10 +102,10 @@ pub async fn refresh(
 )]
 pub async fn sign_out(
     State(state): State<Arc<AppState>>,
-    auth_user: AuthUser,
+    session_user: SessionUser,
     ctx: RequestContext,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
-    let msg = AuthService::sign_out(&state, auth_user.id, auth_user.session_id, &ctx).await?;
+    let msg = AuthService::sign_out(&state, session_user.id, session_user.session_id, &ctx).await?;
     Ok(Json(ApiResponse::success(msg)))
 }
 
@@ -116,10 +116,10 @@ pub async fn sign_out(
 )]
 pub async fn sign_out_all(
     State(state): State<Arc<AppState>>,
-    auth_user: AuthUser,
+    session_user: SessionUser,
     ctx: RequestContext,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
-    let msg = AuthService::sign_out_all(&state, auth_user.id, &ctx).await?;
+    let msg = AuthService::sign_out_all(&state, session_user.id, &ctx).await?;
     Ok(Json(ApiResponse::success(msg)))
 }
 
@@ -219,14 +219,19 @@ pub async fn update_user(
 )]
 pub async fn change_password(
     State(state): State<Arc<AppState>>,
-    auth_user: AuthUser,
+    session_user: SessionUser,
     ctx: RequestContext,
     Json(payload): Json<ChangePasswordRequest>,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
     payload.validate()?;
-    let msg =
-        AuthService::change_password(&state, auth_user.id, auth_user.session_id, payload, &ctx)
-            .await?;
+    let msg = AuthService::change_password(
+        &state,
+        session_user.id,
+        session_user.session_id,
+        payload,
+        &ctx,
+    )
+    .await?;
     Ok(Json(ApiResponse::success(msg)))
 }
 
@@ -237,10 +242,10 @@ pub async fn change_password(
 )]
 pub async fn delete_user(
     State(state): State<Arc<AppState>>,
-    auth_user: AuthUser,
+    session_user: SessionUser,
     ctx: RequestContext,
 ) -> Result<Json<ApiResponse<String>>, AppError> {
-    let msg = AuthService::delete_account(&state, auth_user.id, &ctx).await?;
+    let msg = AuthService::delete_account(&state, session_user.id, &ctx).await?;
     Ok(Json(ApiResponse::success(msg)))
 }
 

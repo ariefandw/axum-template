@@ -16,32 +16,119 @@ use uuid::Uuid;
 use crate::{
     crypto::Secret,
     error::AppError,
+    models::api_key::{ApiScope, ScopeSet},
     services::auth::{AuthService, RequestContext},
     state::AppState,
 };
 
+/// How the caller proved who they are.
+///
+/// This distinction is load-bearing. An interactive session belongs to a human
+/// who just authenticated; an API key is a long-lived machine credential that
+/// may sit in a CI environment or a config file. They must not carry the same
+/// authority.
+#[derive(Clone, Debug)]
+pub enum Credential {
+    Session { session_id: Uuid },
+    ApiKey { key_id: Uuid, scopes: ScopeSet },
+}
+
+impl Credential {
+    /// Authorize one capability. A session carries the account's full authority;
+    /// an API key carries only what it declared at creation.
+    pub fn require_scope(&self, scope: ApiScope) -> Result<(), AppError> {
+        match self {
+            Credential::Session { .. } => Ok(()),
+            Credential::ApiKey { scopes, .. } => {
+                if scopes.contains(scope) {
+                    Ok(())
+                } else {
+                    Err(AppError::Forbidden(format!(
+                        "This API key does not carry the '{}' scope",
+                        scope.as_str()
+                    )))
+                }
+            }
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct AuthUser {
     pub id: Uuid,
-    pub session_id: Uuid,
     pub email: String,
     pub role: String,
     pub email_verified: bool,
+    pub credential: Credential,
 }
 
 impl AuthUser {
     pub fn is_admin(&self) -> bool {
         self.role == "admin"
     }
+
+    pub fn is_api_key(&self) -> bool {
+        matches!(self.credential, Credential::ApiKey { .. })
+    }
+
+    /// The session this caller is on, if they are on one. `None` for API keys,
+    /// which deliberately have no session: the previous implementation used
+    /// `Uuid::nil()`, which silently matched no row and made session-scoped
+    /// operations look like they succeeded.
+    pub fn session_id(&self) -> Option<Uuid> {
+        match self.credential {
+            Credential::Session { session_id } => Some(session_id),
+            Credential::ApiKey { .. } => None,
+        }
+    }
+
+    pub fn require_scope(&self, scope: ApiScope) -> Result<(), AppError> {
+        self.credential.require_scope(scope)
+    }
+
+    /// Refuse an operation to machine credentials outright.
+    ///
+    /// Account-lifecycle actions — changing the password, deleting the account,
+    /// revoking sessions, minting further keys — are the ones that let a leaked
+    /// key escalate into permanent control, so no scope unlocks them.
+    pub fn require_interactive_session(&self, action: &str) -> Result<(), AppError> {
+        match self.credential {
+            Credential::Session { .. } => Ok(()),
+            Credential::ApiKey { .. } => Err(AppError::Forbidden(format!(
+                "{action} requires an interactive session; API keys cannot perform it"
+            ))),
+        }
+    }
 }
 
 /// Requires the `admin` role, re-read from the database rather than trusted from
 /// the token, so a demoted administrator loses access at once.
+///
+/// An API key additionally has to carry the `admin` scope. Holding an
+/// administrator's key is not the same as an administrator sitting at a console.
 #[derive(Debug, Clone)]
 pub struct AdminUser {
     pub id: Uuid,
+    pub email: String,
+    pub credential: Credential,
+}
+
+/// Requires an interactive session, refusing API keys regardless of scope.
+///
+/// Used by the account-lifecycle routes, which need a real `session_id` and must
+/// never be reachable with a machine credential.
+#[derive(Debug, Clone)]
+pub struct SessionUser {
+    pub id: Uuid,
     pub session_id: Uuid,
     pub email: String,
+    pub role: String,
+}
+
+impl AdminUser {
+    pub fn require_scope(&self, scope: ApiScope) -> Result<(), AppError> {
+        self.credential.require_scope(scope)
+    }
 }
 
 /// Resolves to `Some` when a valid session is presented and `None` otherwise,
@@ -82,17 +169,21 @@ where
 {
     let state: Arc<AppState> = FromRef::from_ref(state_ref);
 
-    // 1. Check for x-api-key header (Better Auth M2M convention)
+    // 1. x-api-key (Better Auth M2M convention). The key's declared scopes ride
+    //    along on the credential so every handler can enforce them.
     if let Some(api_key) = parts.headers.get("x-api-key").and_then(|h| h.to_str().ok()) {
-        let (user, _key_record) =
+        let (user, key_record) =
             crate::services::api_key::ApiKeyService::resolve_key(&state, api_key).await?;
 
         return Ok(AuthUser {
             id: user.id,
-            session_id: Uuid::nil(), // M2M API Keys use nil session
             email: user.email,
             role: user.role,
             email_verified: user.email_verified,
+            credential: Credential::ApiKey {
+                key_id: key_record.id,
+                scopes: ScopeSet::from_stored(key_record.scopes.as_ref()),
+            },
         });
     }
 
@@ -111,10 +202,10 @@ where
 
     Ok(AuthUser {
         id: user.id,
-        session_id,
         email: user.email,
         role: user.role,
         email_verified: user.email_verified,
+        credential: Credential::Session { session_id },
     })
 }
 
@@ -156,10 +247,39 @@ where
                 "Access forbidden: admin privileges required".to_string(),
             ));
         }
+        // Both conditions must hold for a key: the account is an administrator
+        // AND the key was explicitly issued for administration.
+        auth_user.require_scope(ApiScope::Admin)?;
+
         Ok(AdminUser {
             id: auth_user.id,
-            session_id: auth_user.session_id,
             email: auth_user.email,
+            credential: auth_user.credential,
+        })
+    }
+}
+
+impl<S> FromRequestParts<S> for SessionUser
+where
+    S: Send + Sync,
+    Arc<AppState>: FromRef<S>,
+{
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let auth_user = authenticate(parts, state).await?;
+        let session_id = auth_user.session_id().ok_or_else(|| {
+            AppError::Forbidden(
+                "This operation requires an interactive session; API keys cannot perform it"
+                    .to_string(),
+            )
+        })?;
+
+        Ok(SessionUser {
+            id: auth_user.id,
+            session_id,
+            email: auth_user.email,
+            role: auth_user.role,
         })
     }
 }

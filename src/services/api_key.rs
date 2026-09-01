@@ -6,7 +6,7 @@ use crate::{
     crypto::{random_token, sha256_hex},
     error::AppError,
     models::{
-        api_key::{ApiKeyRecord, CreateApiKeyRequest, CreateApiKeyResponse},
+        api_key::{ApiKeyRecord, CreateApiKeyRequest, CreateApiKeyResponse, ScopeSet},
         pagination::PageParams,
         user::User,
     },
@@ -30,7 +30,10 @@ impl ApiKeyService {
         let key_start = format!("ak_live_{}...", &random_part[..6]);
         let key_hash = sha256_hex(&plaintext_key);
 
-        let scopes = req.scopes.unwrap_or_else(|| vec!["*".to_string()]);
+        // Rejects unknown scope names rather than dropping them, so a key never
+        // ends up with quietly different authority than the caller requested.
+        let scope_set = ScopeSet::parse_request(req.scopes.as_deref())?;
+        let scopes = scope_set.to_strings();
         let scopes_json = serde_json::json!(&scopes);
 
         let expires_at = req
@@ -177,16 +180,27 @@ impl ApiKeyService {
             return Err(AppError::Forbidden("User account is banned".to_string()));
         }
 
-        // Update last_used_at
-        let db = state.db.clone();
-        let kid = key_record.id;
-        tokio::spawn(async move {
-            let _ =
-                sqlx::query("UPDATE api_keys SET last_used_at = CURRENT_TIMESTAMP WHERE id = $1")
-                    .bind(kid)
-                    .execute(&db)
-                    .await;
-        });
+        // Record last use, but at most once a minute per key. Writing on every
+        // request turns a read-only API call into a write and makes this row a
+        // contention point for any key under real traffic; minute granularity is
+        // all a "last used" display needs.
+        let needs_touch = key_record
+            .last_used_at
+            .is_none_or(|last| Utc::now() - last > Duration::minutes(1));
+
+        if needs_touch {
+            let db = state.db.clone();
+            let kid = key_record.id;
+            tokio::spawn(async move {
+                let _ = sqlx::query(
+                    "UPDATE api_keys SET last_used_at = now() \
+                     WHERE id = $1 AND (last_used_at IS NULL OR last_used_at < now() - interval '1 minute')",
+                )
+                .bind(kid)
+                .execute(&db)
+                .await;
+            });
+        }
 
         Ok((user, key_record))
     }

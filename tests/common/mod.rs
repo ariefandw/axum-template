@@ -149,6 +149,104 @@ impl TestApp {
         body["data"]["access_token"].as_str().unwrap().to_string()
     }
 
+    /// Authenticate with an API key rather than a bearer token.
+    pub async fn get_with_key(&self, uri: &str, key: &str) -> (StatusCode, Value) {
+        self.request(
+            Request::builder()
+                .uri(uri)
+                .method("GET")
+                .header("x-api-key", key)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+    }
+
+    pub async fn call_with_key(
+        &self,
+        method: &str,
+        uri: &str,
+        key: &str,
+        body: Option<Value>,
+    ) -> (StatusCode, Value) {
+        let mut builder = Request::builder()
+            .uri(uri)
+            .method(method)
+            .header("x-api-key", key)
+            .header(header::CONTENT_TYPE, "application/json");
+        let _ = &mut builder;
+        let payload = match body {
+            Some(v) => Body::from(serde_json::to_vec(&v).unwrap()),
+            None => Body::empty(),
+        };
+        self.request(builder.body(payload).unwrap()).await
+    }
+
+    /// Mint an API key with the given scopes, returning the plaintext secret.
+    pub async fn create_api_key(&self, token: &str, scopes: Option<Vec<&str>>) -> String {
+        let mut body = serde_json::json!({ "name": "test key" });
+        if let Some(scopes) = scopes {
+            body["scopes"] = serde_json::json!(scopes);
+        }
+        let (status, resp) = self
+            .post_as("/api/v1/auth/api-key/create", body, token)
+            .await;
+        assert_eq!(
+            status,
+            StatusCode::CREATED,
+            "api key creation failed: {resp}"
+        );
+        resp["data"]["key"].as_str().unwrap().to_string()
+    }
+
+    /// Create an app and an organization owned by `token`, returning both IDs.
+    pub async fn create_app_and_org(&self, token: &str) -> (String, String) {
+        let n = uuid::Uuid::now_v7().simple().to_string();
+        let (s, app) = self
+            .post_as(
+                "/api/v1/apps",
+                serde_json::json!({ "name": "Test App", "slug": format!("app-{}", &n[..12]) }),
+                token,
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "app creation failed: {app}");
+        let app_id = app["data"]["id"].as_str().unwrap().to_string();
+
+        let (s, org) = self
+            .post_as(
+                &format!("/api/v1/apps/{app_id}/orgs"),
+                serde_json::json!({ "name": "Test Org", "slug": format!("org-{}", &n[..12]) }),
+                token,
+            )
+            .await;
+        assert_eq!(s, StatusCode::CREATED, "org creation failed: {org}");
+        (app_id, org["data"]["id"].as_str().unwrap().to_string())
+    }
+
+    /// Upload a PNG, optionally attributing it to an organization.
+    pub async fn upload_png_to_org(
+        &self,
+        token: &str,
+        visibility: &str,
+        org_id: Option<&str>,
+    ) -> (StatusCode, Value) {
+        let (boundary, body) =
+            multipart_body_with_org("avatar.png", "image/png", PNG_BYTES, visibility, org_id);
+        self.request(
+            Request::builder()
+                .uri("/api/v1/files/upload")
+                .method("POST")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header(
+                    header::CONTENT_TYPE,
+                    format!("multipart/form-data; boundary={boundary}"),
+                )
+                .body(Body::from(body))
+                .unwrap(),
+        )
+        .await
+    }
+
     pub async fn upload_png(&self, token: &str, visibility: &str) -> (StatusCode, Value) {
         let (boundary, body) = multipart_body("avatar.png", "image/png", PNG_BYTES, visibility);
         self.request(
@@ -207,6 +305,41 @@ pub fn json_request(
 /// database without collisions.
 pub fn unique_email(prefix: &str) -> String {
     format!("{prefix}-{}@test.local", uuid::Uuid::now_v7().simple())
+}
+
+pub fn multipart_body_with_org(
+    filename: &str,
+    content_type: &str,
+    bytes: &[u8],
+    visibility: &str,
+    org_id: Option<&str>,
+) -> (String, Vec<u8>) {
+    let boundary = format!("----test{}", uuid::Uuid::now_v7().simple());
+    let mut body = Vec::new();
+
+    let mut text_field = |name: &str, value: &str| {
+        body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+        body.extend_from_slice(
+            format!("Content-Disposition: form-data; name=\"{name}\"\r\n\r\n").as_bytes(),
+        );
+        body.extend_from_slice(value.as_bytes());
+        body.extend_from_slice(b"\r\n");
+    };
+    text_field("visibility", visibility);
+    if let Some(org) = org_id {
+        text_field("org_id", org);
+    }
+
+    body.extend_from_slice(format!("--{boundary}\r\n").as_bytes());
+    body.extend_from_slice(
+        format!("Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n")
+            .as_bytes(),
+    );
+    body.extend_from_slice(format!("Content-Type: {content_type}\r\n\r\n").as_bytes());
+    body.extend_from_slice(bytes);
+    body.extend_from_slice(format!("\r\n--{boundary}--\r\n").as_bytes());
+
+    (boundary, body)
 }
 
 pub fn multipart_body(

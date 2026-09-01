@@ -8,6 +8,9 @@ use uuid::Uuid;
 pub struct Notification {
     pub id: Uuid,
     pub user_id: Uuid,
+    /// Set when the notification concerns an organization rather than the
+    /// recipient personally.
+    pub org_id: Option<Uuid>,
     pub title: String,
     pub body: String,
     pub read: bool,

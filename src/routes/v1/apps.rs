@@ -12,6 +12,7 @@ use crate::{
     error::{ApiErrorResponse, ApiResponse, AppError},
     middleware::auth::AuthUser,
     models::{
+        api_key::ApiScope,
         org::{
             AddOrgMemberRequest, App, CreateAppRequest, CreateOrgRequest, OrgMember, Organization,
         },
@@ -47,6 +48,7 @@ pub async fn create_app(
     Json(payload): Json<CreateAppRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<App>>), AppError> {
     payload.validate()?;
+    auth_user.require_scope(ApiScope::AppsWrite)?;
     let app = OrgService::create_app(&state, auth_user.id, payload, &ctx).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::success(app))))
 }
@@ -109,6 +111,7 @@ pub async fn create_org(
     Json(payload): Json<CreateOrgRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<Organization>>), AppError> {
     payload.validate()?;
+    auth_user.require_scope(ApiScope::OrgsWrite)?;
     let org = OrgService::create_org(&state, app_id, auth_user.id, payload, &ctx).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::success(org))))
 }
@@ -173,6 +176,7 @@ pub async fn add_org_member(
     Json(payload): Json<AddOrgMemberRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<OrgMember>>), AppError> {
     payload.validate()?;
+    auth_user.require_scope(ApiScope::OrgsWrite)?;
     let member = OrgService::add_member(&state, org_id, auth_user.id, payload, &ctx).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::success(member))))
 }

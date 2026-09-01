@@ -283,6 +283,38 @@ impl OrgService {
         Ok(member)
     }
 
+    /// Assert the caller holds at least `minimum` in this organization.
+    ///
+    /// A non-member is told the organization does not exist, so this cannot be
+    /// used to discover which org IDs are real — the same convention the storage
+    /// layer uses for files.
+    pub async fn require_org_role(
+        state: &Arc<AppState>,
+        org_id: Uuid,
+        user_id: Uuid,
+        minimum: OrgRole,
+    ) -> Result<OrgRole, AppError> {
+        let role = Self::get_user_org_role(state, org_id, user_id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("Organization not found".to_string()))?;
+
+        if role < minimum {
+            return Err(AppError::Forbidden(format!(
+                "This action requires the '{minimum}' role or higher in this organization"
+            )));
+        }
+        Ok(role)
+    }
+
+    /// Membership without a minimum, for read paths.
+    pub async fn require_membership(
+        state: &Arc<AppState>,
+        org_id: Uuid,
+        user_id: Uuid,
+    ) -> Result<OrgRole, AppError> {
+        Self::require_org_role(state, org_id, user_id, OrgRole::Member).await
+    }
+
     pub async fn get_user_org_role(
         state: &Arc<AppState>,
         org_id: Uuid,
