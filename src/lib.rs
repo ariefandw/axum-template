@@ -26,6 +26,7 @@ pub mod state;
 
 use crate::{
     error::{ApiErrorPayload, ApiErrorResponse, ApiResponse},
+    models::events::{AuditLog, Notification, RealtimeEvent},
     models::pagination::{CursorMeta, CursorParams, PageMeta, PageParams},
     models::upload::UploadResponse,
     models::user::{
@@ -43,7 +44,7 @@ use crate::{
     info(
         title = "Axum Production API",
         version = "1.0.0",
-        description = "Production-ready Axum API scaffold with Auth, Rate Limiting, Idempotency, Metrics, and OpenAPI Docs"
+        description = "Production-ready Axum API scaffold with Auth, Rate Limiting, Idempotency, Metrics, Realtime, Notifications, and Audit Logs"
     ),
     components(
         schemas(
@@ -53,6 +54,8 @@ use crate::{
             ApiResponse<AuthResponse>,
             ApiResponse<UserResponse>,
             ApiResponse<Vec<UserResponse>>,
+            ApiResponse<Vec<Notification>>,
+            ApiResponse<Vec<AuditLog>>,
             ApiResponse<OAuthUrlResponse>,
             ApiResponse<UploadResponse>,
             ApiResponse<String>,
@@ -70,6 +73,9 @@ use crate::{
             AuthResponse,
             UserResponse,
             UploadResponse,
+            Notification,
+            AuditLog,
+            RealtimeEvent,
             OAuthCallbackQuery,
             OAuthUrlResponse
         )
@@ -79,6 +85,9 @@ use crate::{
         (name = "Observability", description = "Health and Prometheus metrics"),
         (name = "Authentication", description = "User registration, login, verification, and sessions"),
         (name = "Users", description = "User profile management and user queries"),
+        (name = "Notifications", description = "In-app notifications feed"),
+        (name = "Realtime", description = "Server-Sent Events (SSE) stream"),
+        (name = "Audit", description = "Immutable compliance audit logs"),
         (name = "Social Login", description = "OAuth2 endpoints (Google, GitHub)"),
         (name = "Storage", description = "Streaming multipart file uploads & static downloads")
     )
