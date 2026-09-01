@@ -5,7 +5,7 @@
 # Usage: ./scripts/rename-template.sh <new-app-name>
 # Example: ./scripts/rename-template.sh my-cool-saas
 # =============================================================================
-set -euo pipefail
+set -eu
 
 if [ $# -ne 1 ]; then
     echo "Usage: $0 <new-app-name>"
@@ -24,6 +24,7 @@ echo "    axum_template -> ${NEW_SNAKE}"
 # Explicitly tracked configuration and deployment files
 FILES_TO_REPLACE=(
     Cargo.toml
+    Cargo.lock
     Dockerfile
     docker-compose.yml
     .env.example
