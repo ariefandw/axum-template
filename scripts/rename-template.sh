@@ -21,9 +21,10 @@ echo "==> Renaming template across all files:"
 echo "    axum-template -> ${NEW_NAME}"
 echo "    axum_template -> ${NEW_SNAKE}"
 
-# Target files that contain crate/app names (excluding .git, target, scripts, etc.)
+# Explicitly tracked configuration and deployment files
 FILES_TO_REPLACE=(
     Cargo.toml
+    Dockerfile
     docker-compose.yml
     .env.example
     .github/workflows/ci.yml
@@ -31,7 +32,7 @@ FILES_TO_REPLACE=(
     openapi.json
 )
 
-# 1. Replace in explicitly tracked configuration files
+# 1. Replace in explicitly tracked configuration & deployment files
 for file in "${FILES_TO_REPLACE[@]}"; do
     if [ -f "$file" ]; then
         sed -i.bak "s/axum_template/${NEW_SNAKE}/g" "$file"
@@ -52,4 +53,5 @@ cargo check --all-targets --all-features
 cargo run --bin export_openapi
 
 echo "==> SUCCESS: Project successfully renamed to '${NEW_NAME}'!"
+echo "    NOTE: Remember to update LICENSE copyright attribution if appropriate."
 echo "    Verify with 'git diff' and commit your changes."
