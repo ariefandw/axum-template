@@ -48,10 +48,19 @@ find src tests -type f -name "*.rs" | while read -r file; do
     rm -f "${file}.bak"
 done
 
+# 3. Self-check: Assert zero remaining occurrences of old template name in code files
+echo "==> Verifying zero remaining occurrences of old template names..."
+STRAGGLERS=$(git grep -EI "axum[-_]template" -- ":(exclude)scripts/rename-template.sh" ":(exclude)LICENSE" ":(exclude)MESSAGE_TO_AGENTS.md" || true)
+if [ -n "$STRAGGLERS" ]; then
+    echo "::error::Found unconverted occurrences of axum-template / axum_template:"
+    echo "$STRAGGLERS"
+    exit 1
+fi
+
 echo "==> Re-exporting openapi.json and checking compilation..."
 cargo check --all-targets --all-features
 cargo run --bin export_openapi
 
-echo "==> SUCCESS: Project successfully renamed to '${NEW_NAME}'!"
+echo "==> SUCCESS: Project successfully renamed to '${NEW_NAME}' with 0 stragglers!"
 echo "    NOTE: Remember to update LICENSE copyright attribution if appropriate."
 echo "    Verify with 'git diff' and commit your changes."
