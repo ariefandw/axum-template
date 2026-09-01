@@ -336,4 +336,84 @@ impl AuthService {
 
         Ok("Password has been reset successfully".to_string())
     }
+
+    pub async fn update_profile(
+        state: &Arc<AppState>,
+        user_id: Uuid,
+        req: crate::models::user::UpdateUserRequest,
+    ) -> Result<crate::models::user::UserResponse, AppError> {
+        let now = Utc::now();
+        let user = sqlx::query_as::<_, User>(
+            r#"
+            UPDATE users
+            SET name = COALESCE($2, name),
+                image = COALESCE($3, image),
+                updated_at = $4
+            WHERE id = $1
+            RETURNING id, name, email, email_verified, image, role, banned, created_at, updated_at
+            "#,
+        )
+        .bind(user_id)
+        .bind(req.name)
+        .bind(req.image)
+        .bind(now)
+        .fetch_one(&state.db)
+        .await?;
+
+        Ok(user.into())
+    }
+
+    pub async fn change_password(
+        state: &Arc<AppState>,
+        user_id: Uuid,
+        req: crate::models::user::ChangePasswordRequest,
+    ) -> Result<String, AppError> {
+        let account = sqlx::query_as::<_, Account>(
+            "SELECT id, user_id, account_id, provider_id, password, access_token, refresh_token, access_token_expires_at, created_at, updated_at FROM accounts WHERE user_id = $1 AND provider_id = 'credential'",
+        )
+        .bind(user_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("User has no password account configured (OAuth login)".to_string()))?;
+
+        let password_hash = account
+            .password
+            .as_ref()
+            .ok_or_else(|| AppError::BadRequest("Password not set".to_string()))?;
+
+        if !Self::verify_password(&req.current_password, password_hash)? {
+            return Err(AppError::Unauthorized("Incorrect current password".to_string()));
+        }
+
+        let new_hash = Self::hash_password(&req.new_password)?;
+        let now = Utc::now();
+
+        sqlx::query(
+            "UPDATE accounts SET password = $2, updated_at = $3 WHERE id = $1",
+        )
+        .bind(account.id)
+        .bind(new_hash)
+        .bind(now)
+        .execute(&state.db)
+        .await?;
+
+        Ok("Password changed successfully".to_string())
+    }
+
+    pub async fn delete_account(
+        state: &Arc<AppState>,
+        user_id: Uuid,
+    ) -> Result<String, AppError> {
+        let rows_affected = sqlx::query("DELETE FROM users WHERE id = $1")
+            .bind(user_id)
+            .execute(&state.db)
+            .await?
+            .rows_affected();
+
+        if rows_affected == 0 {
+            return Err(AppError::NotFound("User not found".to_string()));
+        }
+
+        Ok("Account deleted successfully".to_string())
+    }
 }

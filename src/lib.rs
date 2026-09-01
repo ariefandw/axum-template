@@ -26,10 +26,12 @@ pub mod state;
 
 use crate::{
     error::{ApiErrorPayload, ApiErrorResponse, ApiResponse},
+    models::pagination::{CursorMeta, CursorParams, PageMeta, PageParams},
     models::upload::UploadResponse,
     models::user::{
-        AuthResponse, ForgetPasswordRequest, ResetPasswordRequest, SignInEmailRequest,
-        SignUpEmailRequest, UserResponse, VerifyEmailRequest,
+        AuthResponse, ChangePasswordRequest, ForgetPasswordRequest, ResetPasswordRequest,
+        SignInEmailRequest, SignUpEmailRequest, UpdateUserRequest, UserResponse,
+        VerifyEmailRequest,
     },
     routes::health::HealthResponse,
     routes::v1::auth::{OAuthCallbackQuery, OAuthUrlResponse},
@@ -50,6 +52,7 @@ use crate::{
             ApiErrorPayload,
             ApiResponse<AuthResponse>,
             ApiResponse<UserResponse>,
+            ApiResponse<Vec<UserResponse>>,
             ApiResponse<OAuthUrlResponse>,
             ApiResponse<UploadResponse>,
             ApiResponse<String>,
@@ -58,6 +61,12 @@ use crate::{
             VerifyEmailRequest,
             ForgetPasswordRequest,
             ResetPasswordRequest,
+            UpdateUserRequest,
+            ChangePasswordRequest,
+            PageParams,
+            PageMeta,
+            CursorParams,
+            CursorMeta,
             AuthResponse,
             UserResponse,
             UploadResponse,
@@ -69,6 +78,7 @@ use crate::{
     tags(
         (name = "Observability", description = "Health and Prometheus metrics"),
         (name = "Authentication", description = "User registration, login, verification, and sessions"),
+        (name = "Users", description = "User profile management and user queries"),
         (name = "Social Login", description = "OAuth2 endpoints (Google, GitHub)"),
         (name = "Storage", description = "Streaming multipart file uploads & static downloads")
     )

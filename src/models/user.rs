@@ -1,4 +1,4 @@
-﻿use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sqlx::FromRow;
 use utoipa::ToSchema;
@@ -74,6 +74,20 @@ pub struct ForgetPasswordRequest {
 #[derive(Debug, Deserialize, Validate, ToSchema)]
 pub struct ResetPasswordRequest {
     pub token: String,
+    #[validate(length(min = 8, message = "New password must be at least 8 characters"))]
+    pub new_password: String,
+}
+
+#[derive(Debug, Deserialize, Validate, ToSchema)]
+pub struct UpdateUserRequest {
+    #[validate(length(min = 2, message = "Name must be at least 2 characters"))]
+    pub name: Option<String>,
+    pub image: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Validate, ToSchema)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
     #[validate(length(min = 8, message = "New password must be at least 8 characters"))]
     pub new_password: String,
 }
