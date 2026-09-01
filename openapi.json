@@ -16,6 +16,39 @@
           "Applications"
         ],
         "operationId": "list_apps",
+        "parameters": [
+          {
+            "name": "page",
+            "in": "query",
+            "description": "Page number (1-indexed, default: 1)",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "default": 1,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "Items per page (default: 20, max: 100)",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1
+            }
+          }
+        ],
         "responses": {
           "200": {
             "description": "List of applications owned by current user",
@@ -167,6 +200,26 @@
               }
             }
           },
+          "403": {
+            "description": "Forbidden: Caller must be Org Admin or Owner",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Organization not found or caller not a member",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
           "409": {
             "description": "User is already an org member",
             "content": {
@@ -201,11 +254,42 @@
               "type": "string",
               "format": "uuid"
             }
+          },
+          {
+            "name": "page",
+            "in": "query",
+            "description": "Page number (1-indexed, default: 1)",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "default": 1,
+              "minimum": 1
+            }
+          },
+          {
+            "name": "page_size",
+            "in": "query",
+            "description": "Items per page (default: 20, max: 100)",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64",
+              "default": 20,
+              "maximum": 100,
+              "minimum": 1
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "List of organizations under this app",
+            "description": "List of organizations under this app (Owner only)",
             "content": {
               "application/json": {
                 "schema": {
@@ -216,6 +300,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "App not found or not owned by user",
             "content": {
               "application/json": {
                 "schema": {
@@ -281,6 +375,16 @@
           },
           "401": {
             "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "App not found or not owned by user",
             "content": {
               "application/json": {
                 "schema": {
@@ -1721,7 +1825,7 @@
         ],
         "properties": {
           "role": {
-            "type": "string"
+            "$ref": "#/components/schemas/OrgRole"
           },
           "user_id": {
             "type": "string",
@@ -2929,6 +3033,14 @@
             "format": "uuid"
           }
         }
+      },
+      "OrgRole": {
+        "type": "string",
+        "enum": [
+          "member",
+          "admin",
+          "owner"
+        ]
       },
       "Organization": {
         "type": "object",

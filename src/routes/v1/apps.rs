@@ -1,6 +1,6 @@
 use axum::{
     Json,
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
 };
 use std::sync::Arc;
@@ -11,10 +11,13 @@ use validator::Validate;
 use crate::{
     error::{ApiErrorResponse, ApiResponse, AppError},
     middleware::auth::AuthUser,
-    models::org::{
-        AddOrgMemberRequest, App, CreateAppRequest, CreateOrgRequest, OrgMember, Organization,
+    models::{
+        org::{
+            AddOrgMemberRequest, App, CreateAppRequest, CreateOrgRequest, OrgMember, Organization,
+        },
+        pagination::{PageMeta, PageParams},
     },
-    services::org::OrgService,
+    services::{auth::RequestContext, org::OrgService},
     state::AppState,
 };
 
@@ -38,18 +41,20 @@ use crate::{
     tag = "Applications"
 )]
 pub async fn create_app(
-    State(state): State<Arc<AppState>>,
     auth_user: AuthUser,
+    ctx: RequestContext,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateAppRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<App>>), AppError> {
     payload.validate()?;
-    let app = OrgService::create_app(&state, auth_user.id, payload).await?;
+    let app = OrgService::create_app(&state, auth_user.id, payload, &ctx).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::success(app))))
 }
 
 #[utoipa::path(
     get,
     path = "",
+    params(PageParams),
     responses(
         (status = 200, description = "List of applications owned by current user", body = ApiResponse<Vec<App>>),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse)
@@ -60,11 +65,17 @@ pub async fn create_app(
     tag = "Applications"
 )]
 pub async fn list_apps(
-    State(state): State<Arc<AppState>>,
     auth_user: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PageParams>,
 ) -> Result<Json<ApiResponse<Vec<App>>>, AppError> {
-    let apps = OrgService::list_user_apps(&state, auth_user.id).await?;
-    Ok(Json(ApiResponse::success(apps)))
+    let (apps, total_count) =
+        OrgService::list_user_apps(&state, auth_user.id, params.clone()).await?;
+    let meta = PageMeta::new(params.page(), params.page_size(), total_count);
+    Ok(Json(ApiResponse::with_meta(
+        apps,
+        serde_json::to_value(meta).unwrap(),
+    )))
 }
 
 // =========================================================================
@@ -81,6 +92,7 @@ pub async fn list_apps(
     responses(
         (status = 201, description = "Organization created successfully", body = ApiResponse<Organization>),
         (status = 400, description = "Validation error", body = ApiErrorResponse),
+        (status = 404, description = "App not found or not owned by user", body = ApiErrorResponse),
         (status = 409, description = "Org slug already exists in this app", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse)
     ),
@@ -90,13 +102,14 @@ pub async fn list_apps(
     tag = "Organizations"
 )]
 pub async fn create_org(
-    State(state): State<Arc<AppState>>,
-    auth_user: AuthUser,
     Path(app_id): Path<Uuid>,
+    auth_user: AuthUser,
+    ctx: RequestContext,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<CreateOrgRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<Organization>>), AppError> {
     payload.validate()?;
-    let org = OrgService::create_org(&state, app_id, auth_user.id, payload).await?;
+    let org = OrgService::create_org(&state, app_id, auth_user.id, payload, &ctx).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::success(org))))
 }
 
@@ -104,10 +117,12 @@ pub async fn create_org(
     get,
     path = "/{app_id}/orgs",
     params(
-        ("app_id" = Uuid, Path, description = "Target Application ID")
+        ("app_id" = Uuid, Path, description = "Target Application ID"),
+        PageParams
     ),
     responses(
-        (status = 200, description = "List of organizations under this app", body = ApiResponse<Vec<Organization>>),
+        (status = 200, description = "List of organizations under this app (Owner only)", body = ApiResponse<Vec<Organization>>),
+        (status = 404, description = "App not found or not owned by user", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse)
     ),
     security(
@@ -116,12 +131,18 @@ pub async fn create_org(
     tag = "Organizations"
 )]
 pub async fn list_orgs(
-    State(state): State<Arc<AppState>>,
-    _auth_user: AuthUser,
     Path(app_id): Path<Uuid>,
+    auth_user: AuthUser,
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<PageParams>,
 ) -> Result<Json<ApiResponse<Vec<Organization>>>, AppError> {
-    let orgs = OrgService::list_app_orgs(&state, app_id).await?;
-    Ok(Json(ApiResponse::success(orgs)))
+    let (orgs, total_count) =
+        OrgService::list_app_orgs(&state, app_id, auth_user.id, params.clone()).await?;
+    let meta = PageMeta::new(params.page(), params.page_size(), total_count);
+    Ok(Json(ApiResponse::with_meta(
+        orgs,
+        serde_json::to_value(meta).unwrap(),
+    )))
 }
 
 #[utoipa::path(
@@ -134,6 +155,8 @@ pub async fn list_orgs(
     responses(
         (status = 201, description = "Member added to organization", body = ApiResponse<OrgMember>),
         (status = 400, description = "Validation error", body = ApiErrorResponse),
+        (status = 403, description = "Forbidden: Caller must be Org Admin or Owner", body = ApiErrorResponse),
+        (status = 404, description = "Organization not found or caller not a member", body = ApiErrorResponse),
         (status = 409, description = "User is already an org member", body = ApiErrorResponse),
         (status = 401, description = "Unauthorized", body = ApiErrorResponse)
     ),
@@ -143,13 +166,14 @@ pub async fn list_orgs(
     tag = "Organizations"
 )]
 pub async fn add_org_member(
-    State(state): State<Arc<AppState>>,
-    _auth_user: AuthUser,
     Path(org_id): Path<Uuid>,
+    auth_user: AuthUser,
+    ctx: RequestContext,
+    State(state): State<Arc<AppState>>,
     Json(payload): Json<AddOrgMemberRequest>,
 ) -> Result<(StatusCode, Json<ApiResponse<OrgMember>>), AppError> {
     payload.validate()?;
-    let member = OrgService::add_member(&state, org_id, payload).await?;
+    let member = OrgService::add_member(&state, org_id, auth_user.id, payload, &ctx).await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::success(member))))
 }
 

@@ -40,6 +40,13 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Reject UTF-8 BOMs
+        run: |
+          if git ls-files -z | xargs -0 -I{} sh -c 'head -c3 "{}" | grep -q "^\xef\xbb\xbf" && echo "BOM: {}"' | grep .; then
+            echo "::error::Files above start with a UTF-8 BOM; sqlx::migrate! rejects them"
+            exit 1
+          fi
+
       - name: Check formatting
         run: cargo fmt --all --check
 
