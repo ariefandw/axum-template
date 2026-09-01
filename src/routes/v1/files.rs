@@ -7,7 +7,6 @@ use axum::{
     response::Response,
 };
 use serde::Deserialize;
-use tokio_util::io::ReaderStream;
 use utoipa::IntoParams;
 use utoipa_axum::{router::OpenApiRouter, routes};
 use uuid::Uuid;
@@ -130,7 +129,7 @@ pub async fn create_presigned_url(
 ) -> Result<Json<ApiResponse<PresignedUploadResponse>>, AppError> {
     auth_user.require_scope(ApiScope::FilesWrite)?;
     payload.validate()?;
-    let res = StorageService::generate_presigned_upload(&state, &payload)?;
+    let res = StorageService::generate_presigned_upload(&state, &payload).await?;
     Ok(Json(ApiResponse::success(res)))
 }
 
@@ -152,7 +151,7 @@ pub async fn create_signed_download_url(
     let record = StorageService::load_record(&state, id).await?;
     StorageService::authorize_write(&state, &record, auth_user.id, &auth_user.role).await?;
     Ok(Json(ApiResponse::success(
-        StorageService::generate_signed_download(&state, &record),
+        StorageService::generate_signed_download_url(&state, &record).await?,
     )))
 }
 
@@ -198,8 +197,9 @@ pub async fn get_file(
         .await?;
     }
 
-    let (file, len) = StorageService::open_file(&state, &record).await?;
-    let body = axum::body::Body::from_stream(ReaderStream::new(file));
+    let object = StorageService::open_file(&state, &record).await?;
+    let len = object.len;
+    let body = axum::body::Body::from_stream(object.stream);
 
     let mut response = Response::new(body);
     let headers = response.headers_mut();

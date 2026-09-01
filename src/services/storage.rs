@@ -11,7 +11,7 @@
 //!   leading bytes and is cross-checked against the extension, rather than being
 //!   inferred from an attacker-supplied filename.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::Arc;
 
 use axum::extract::multipart::Field;
@@ -30,60 +30,14 @@ use crate::{
         SignedUrlResponse,
     },
     services::org::OrgService,
+    services::storage_backend::StoredObject,
     state::AppState,
 };
-
-/// Operations a storage backend must provide. The local filesystem backend below
-/// is the default; an S3/R2 backend implements this same seam without touching
-/// the route or authorization layers.
-pub trait StorageBackend: Send + Sync {
-    fn root(&self) -> &Path;
-}
-
-pub struct LocalBackend {
-    root: PathBuf,
-}
-
-impl LocalBackend {
-    pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
-    }
-}
-
-impl StorageBackend for LocalBackend {
-    fn root(&self) -> &Path {
-        &self.root
-    }
-}
 
 pub struct StorageService;
 
 impl StorageService {
     // -- key handling -------------------------------------------------------
-
-    /// Storage keys are generated, never caller-supplied. Validating the shape
-    /// here means path traversal is impossible by construction rather than by
-    /// blocklist.
-    fn validate_storage_key(key: &str) -> Result<(), AppError> {
-        let valid = !key.is_empty()
-            && key.len() <= 128
-            && key
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
-            && !key.contains("..")
-            && !key.starts_with('.');
-
-        if valid {
-            Ok(())
-        } else {
-            Err(AppError::BadRequest("Invalid storage key".to_string()))
-        }
-    }
-
-    fn path_for(state: &Arc<AppState>, storage_key: &str) -> Result<PathBuf, AppError> {
-        Self::validate_storage_key(storage_key)?;
-        Ok(Path::new(&state.config.upload_dir).join(storage_key))
-    }
 
     // -- content typing -----------------------------------------------------
 
@@ -240,10 +194,15 @@ impl StorageService {
         }
 
         let storage_key = format!("{file_id}.{}", Self::extension_for(mime));
-        let final_path = Path::new(&state.config.upload_dir).join(&storage_key);
-        fs::rename(&temp_path, &final_path)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to finalize upload: {e}").into()))?;
+
+        // Validation is complete; hand the finished object to whichever backend
+        // is configured. Everything above this line is identical for local disk
+        // and S3, which is the point of the seam.
+        if let Err(e) = state.storage.put_file(&storage_key, &temp_path, mime).await {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e);
+        }
+        let _ = fs::remove_file(&temp_path).await;
 
         let checksum = format!("{:x}", hasher.finalize());
         let visibility = normalize_visibility(visibility)?;
@@ -273,7 +232,7 @@ impl StorageService {
             Ok(record) => Ok(record),
             Err(e) => {
                 // Never leave an orphaned object behind if the row fails.
-                let _ = fs::remove_file(&final_path).await;
+                let _ = state.storage.delete(&storage_key).await;
                 Err(e.into())
             }
         }
@@ -386,17 +345,13 @@ impl StorageService {
     pub async fn open_file(
         state: &Arc<AppState>,
         record: &FileRecord,
-    ) -> Result<(fs::File, u64), AppError> {
-        let path = Self::path_for(state, &record.storage_key)?;
-        let file = fs::File::open(&path)
-            .await
-            .map_err(|_| AppError::NotFound("File not found".to_string()))?;
-        let len = file
-            .metadata()
-            .await
-            .map(|m| m.len())
-            .unwrap_or(record.size_bytes.max(0) as u64);
-        Ok((file, len))
+    ) -> Result<StoredObject, AppError> {
+        let mut object = state.storage.open(&record.storage_key).await?;
+        if object.len == 0 {
+            // Some backends omit content-length; fall back to the recorded size.
+            object.len = record.size_bytes.max(0) as u64;
+        }
+        Ok(object)
     }
 
     pub async fn delete_file(
@@ -410,15 +365,8 @@ impl StorageService {
 
         // The row is already tombstoned, so the object is unreachable either way;
         // a stranded blob is a cleanup concern, not a request failure.
-        match Self::path_for(state, &record.storage_key) {
-            Ok(path) => {
-                if let Err(e) = fs::remove_file(&path).await {
-                    tracing::warn!(file_id = %record.id, error = %e, "Failed to remove stored object");
-                }
-            }
-            Err(e) => {
-                tracing::warn!(file_id = %record.id, error = %e, "Invalid storage key on delete")
-            }
+        if let Err(e) = state.storage.delete(&record.storage_key).await {
+            tracing::warn!(file_id = %record.id, error = %e, "Failed to remove stored object");
         }
 
         Ok(format!(
@@ -434,7 +382,10 @@ impl StorageService {
     }
 
     /// Issue a signed, expiring grant to upload directly against a reserved key.
-    pub fn generate_presigned_upload(
+    ///
+    /// With S3 this is a true direct-to-storage upload URL, which is the whole
+    /// point of presigning: a 100 MB file never passes through this process.
+    pub async fn generate_presigned_upload(
         state: &Arc<AppState>,
         req: &PresignedUploadRequest,
     ) -> Result<PresignedUploadResponse, AppError> {
@@ -460,11 +411,24 @@ impl StorageService {
         );
 
         let base = state.config.public_base_url.trim_end_matches('/');
-        Ok(PresignedUploadResponse {
-            upload_url: format!(
+        let upload_url = match state
+            .storage
+            .presign_put(
+                &storage_key,
+                &content_type,
+                state.config.signed_url_ttl_seconds,
+            )
+            .await?
+        {
+            Some(native) => native,
+            None => format!(
                 "{base}/api/v1/files/upload?key={storage_key}&expires={}&signature={signature}",
                 expires_at.timestamp()
             ),
+        };
+
+        Ok(PresignedUploadResponse {
+            upload_url,
             file_url: format!("{base}/api/v1/files/{file_id}"),
             storage_key,
             expires_at,
@@ -475,10 +439,28 @@ impl StorageService {
 
     /// Issue a signed, expiring download URL for a private file, so it can be
     /// handed to a browser or CDN without exposing a bearer token.
-    pub fn generate_signed_download(
+    ///
+    /// When the backend can presign natively (S3), the URL points straight at
+    /// object storage and the bytes never transit this service. Otherwise it
+    /// falls back to an application-signed URL served by this process.
+    pub async fn generate_signed_download_url(
         state: &Arc<AppState>,
         record: &FileRecord,
-    ) -> SignedUrlResponse {
+    ) -> Result<SignedUrlResponse, AppError> {
+        let ttl = state.config.signed_url_ttl_seconds;
+
+        if let Some(url) = state.storage.presign_get(&record.storage_key, ttl).await? {
+            return Ok(SignedUrlResponse {
+                url,
+                expires_at: Utc::now() + Duration::seconds(ttl),
+                expires_in_seconds: ttl,
+            });
+        }
+
+        Ok(Self::generate_signed_download(state, record))
+    }
+
+    fn generate_signed_download(state: &Arc<AppState>, record: &FileRecord) -> SignedUrlResponse {
         let expires_at = Utc::now() + Duration::seconds(state.config.signed_url_ttl_seconds);
         let signature = crypto::sign(
             &state.config.url_signing_key,
@@ -571,10 +553,11 @@ mod tests {
 
     #[test]
     fn storage_keys_reject_traversal() {
-        assert!(StorageService::validate_storage_key("0193.png").is_ok());
+        use crate::services::storage_backend::validate_storage_key;
+        assert!(validate_storage_key("0193.png").is_ok());
         for bad in ["../etc/passwd", "a/b.png", "..", ".hidden", "a\\b.png", ""] {
             assert!(
-                StorageService::validate_storage_key(bad).is_err(),
+                validate_storage_key(bad).is_err(),
                 "expected {bad:?} to be rejected"
             );
         }

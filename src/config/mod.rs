@@ -44,6 +44,46 @@ pub struct SmtpConfig {
     pub use_tls: bool,
 }
 
+/// Which object-storage backend serves file bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StorageBackendKind {
+    /// Local disk. Fine for development and single-node deployments; a file
+    /// written by one replica is invisible to the others.
+    Local,
+    /// Any S3-compatible service. Required for horizontal scale.
+    S3,
+}
+
+#[derive(Clone)]
+pub struct S3Config {
+    pub bucket: String,
+    pub region: String,
+    /// Set for non-AWS providers (R2, MinIO, regional clouds). `None` uses the
+    /// AWS endpoint derived from the region.
+    pub endpoint: Option<String>,
+    pub access_key_id: String,
+    pub secret_access_key: Secret,
+    /// Non-AWS providers almost always need path-style addressing, since
+    /// virtual-hosted style requires per-bucket DNS they do not publish.
+    pub force_path_style: bool,
+    /// Key namespace, so one bucket can host several environments safely.
+    pub prefix: String,
+}
+
+impl std::fmt::Debug for S3Config {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("S3Config")
+            .field("bucket", &self.bucket)
+            .field("region", &self.region)
+            .field("endpoint", &self.endpoint)
+            .field("access_key_id", &"<redacted>")
+            .field("secret_access_key", &self.secret_access_key)
+            .field("force_path_style", &self.force_path_style)
+            .field("prefix", &self.prefix)
+            .finish()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct OAuthProviderConfig {
     pub client_id: String,
@@ -93,6 +133,8 @@ pub struct AppConfig {
     pub request_timeout_seconds: u64,
     pub body_limit_bytes: usize,
 
+    pub storage_backend: StorageBackendKind,
+    pub s3: Option<S3Config>,
     pub upload_dir: String,
     pub max_upload_bytes: u64,
     pub allowed_upload_mime: Vec<String>,
@@ -123,6 +165,8 @@ impl std::fmt::Debug for AppConfig {
             .field("trust_proxy_headers", &self.trust_proxy_headers)
             .field("cors_allowed_origins", &self.cors_allowed_origins)
             .field("metrics_token", &self.metrics_token)
+            .field("storage_backend", &self.storage_backend)
+            .field("s3", &self.s3)
             .field("upload_dir", &self.upload_dir)
             .field("max_upload_bytes", &self.max_upload_bytes)
             .field("smtp", &self.smtp)
@@ -264,6 +308,52 @@ impl AppConfig {
             None => None,
         };
 
+        // Storage backend. `s3` requires the full credential set; a partial
+        // configuration is refused rather than silently falling back to local
+        // disk, which would look like it worked until the second replica
+        // started.
+        let storage_backend = match opt_string("STORAGE_BACKEND")
+            .unwrap_or_else(|| "local".into())
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "local" => StorageBackendKind::Local,
+            "s3" => StorageBackendKind::S3,
+            other => {
+                return Err(format!(
+                    "Invalid STORAGE_BACKEND '{other}' (expected local|s3)"
+                ));
+            }
+        };
+
+        let s3 = if storage_backend == StorageBackendKind::S3 {
+            let bucket = require("AWS_BUCKET")?;
+            let access_key_id = require("AWS_ACCESS_KEY_ID")?;
+            let secret_access_key = require("AWS_SECRET_ACCESS_KEY")?;
+            let region = opt_string("AWS_REGION")
+                .or_else(|| opt_string("AWS_DEFAULT_REGION"))
+                .ok_or_else(|| "AWS_REGION is required when STORAGE_BACKEND=s3".to_string())?;
+
+            Some(S3Config {
+                bucket,
+                region,
+                endpoint: opt_string("AWS_ENDPOINT"),
+                access_key_id,
+                secret_access_key: Secret::new(secret_access_key),
+                force_path_style: parse_env("AWS_USE_PATH_STYLE_ENDPOINT", true)?,
+                prefix: opt_string("AWS_KEY_PREFIX").unwrap_or_default(),
+            })
+        } else {
+            if is_prod {
+                tracing::warn!(
+                    "STORAGE_BACKEND=local in production: uploaded files live on this \
+                     container's disk, are invisible to other replicas, and are lost on restart"
+                );
+            }
+            None
+        };
+
         let google = oauth_provider("GOOGLE")?;
         let github = oauth_provider("GITHUB")?;
 
@@ -316,6 +406,8 @@ impl AppConfig {
             idempotency_ttl_seconds: parse_env("IDEMPOTENCY_TTL_SECONDS", 86_400i64)?,
             request_timeout_seconds: parse_env("REQUEST_TIMEOUT_SECONDS", 30u64)?,
             body_limit_bytes: parse_env("BODY_LIMIT_BYTES", 10 * 1024 * 1024usize)?,
+            storage_backend,
+            s3,
             upload_dir: opt_string("UPLOAD_DIR").unwrap_or_else(|| "uploads".into()),
             max_upload_bytes: parse_env("MAX_UPLOAD_BYTES", 10 * 1024 * 1024u64)?,
             allowed_upload_mime,
@@ -365,6 +457,8 @@ impl AppConfig {
             idempotency_ttl_seconds: 86_400,
             request_timeout_seconds: 30,
             body_limit_bytes: 10 * 1024 * 1024,
+            storage_backend: StorageBackendKind::Local,
+            s3: None,
             upload_dir: "target/test_uploads".into(),
             max_upload_bytes: 10 * 1024 * 1024,
             allowed_upload_mime: [
@@ -395,6 +489,7 @@ impl AppConfig {
             metrics_protected = self.metrics_token.is_some(),
             proxy_headers_trusted = self.trust_proxy_headers,
             mailer = if self.smtp.is_some() { "smtp" } else { "log-only (development)" },
+            storage = ?self.storage_backend,
             google_oauth = self.google.is_some(),
             github_oauth = self.github.is_some(),
             access_token_ttl_minutes = self.access_token_ttl_minutes,

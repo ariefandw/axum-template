@@ -7,3 +7,4 @@ pub mod oauth;
 pub mod org;
 pub mod realtime;
 pub mod storage;
+pub mod storage_backend;

@@ -1,7 +1,9 @@
 # Axum Production Scaffold
 
 A strictly-typed backend scaffold on Axum 0.8, SQLx/PostgreSQL, Tower and OpenAPI.
-One binary, one database, no other runtime dependencies.
+One binary and one database by default — realtime fan-out and idempotency use
+PostgreSQL rather than adding Redis. Object storage is the one optional
+dependency, and only when you scale past a single node.
 
 ## Features
 
@@ -13,8 +15,11 @@ One binary, one database, no other runtime dependencies.
 - **Authorization** — `AuthUser`, `AdminUser` and `OptionalAuthUser` extractors.
   Roles are re-read from the database per request, never trusted from the token.
 - **Storage** — streaming multipart uploads with content-based type detection,
-  per-file ownership and visibility, and genuinely HMAC-signed expiring upload
-  and download URLs. Backends sit behind a `StorageBackend` trait.
+  per-file ownership, org-level sharing and visibility, and genuinely signed
+  expiring upload and download URLs. Local disk and S3-compatible object storage
+  sit behind one `StorageBackend` trait, selected by configuration; with S3,
+  presigned URLs let clients upload and download without the bytes passing
+  through this service.
 - **Realtime** — Server-Sent Events fanned out across replicas over PostgreSQL
   `LISTEN`/`NOTIFY`, with dropped events signalled to the client rather than
   silently discarded.
@@ -58,6 +63,15 @@ export DATABASE_URL=postgres://postgres:postgrespassword@localhost:5432/axum_tem
 cargo test
 ```
 
+The S3 backend has its own suite, skipped unless a bucket is configured:
+
+```bash
+export STORAGE_BACKEND=s3 AWS_BUCKET=... AWS_REGION=... AWS_ENDPOINT=...
+export AWS_ACCESS_KEY_ID=... AWS_SECRET_ACCESS_KEY=...
+export AWS_KEY_PREFIX="ci-$(date +%s)"   # isolate test objects in a shared bucket
+cargo test --test s3_backend
+```
+
 The same gate CI enforces:
 
 ```bash
@@ -98,8 +112,13 @@ Two further settings deserve thought:
   you control: when true, `X-Forwarded-For` decides both the rate-limit bucket
   and the client IP recorded in the audit trail, so an untrusted caller could
   otherwise choose both.
-- `UPLOAD_DIR` must be a mounted volume. Container-local storage disappears with
-  the container and is invisible to other replicas.
+- `STORAGE_BACKEND` defaults to `local`, which pins you to a single node: a file
+  written by one replica is invisible to the others and is lost when the
+  container is replaced. Set it to `s3` (with `AWS_BUCKET`, `AWS_REGION`,
+  `AWS_ACCESS_KEY_ID` and `AWS_SECRET_ACCESS_KEY`) before running more than one
+  replica. Non-AWS providers also need `AWS_ENDPOINT` and
+  `AWS_USE_PATH_STYLE_ENDPOINT=true`. If you stay on `local`, `UPLOAD_DIR` must
+  be a mounted volume.
 
 ## Architecture
 

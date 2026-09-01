@@ -54,10 +54,16 @@ utoipa = { version = "5.3", features = ["axum_extras", "uuid", "chrono"] }
 utoipa-axum = "0.2"
 utoipa-scalar = { version = "0.3", features = ["axum"] }
 
+# Object storage (S3-compatible: AWS, R2, MinIO, and other providers)
+aws-sdk-s3 = { version = "1", default-features = false, features = ["rt-tokio", "behavior-version-latest", "default-https-client"] }
+aws-credential-types = "1"
+aws-smithy-types = { version = "1", features = ["rt-tokio"] }
+
 # Types & Utilities
 chrono = { version = "0.4", features = ["serde"] }
 uuid = { version = "1.13", features = ["serde", "v4", "v7"] }
 thiserror = "2.0"
+async-trait = "0.1"
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 governor = "0.8"
 metrics = "0.24"

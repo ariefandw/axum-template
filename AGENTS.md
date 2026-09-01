@@ -52,7 +52,7 @@ incomplete work.
 
 ## 2. Security model
 
-The template's security rests on seven decisions. Change any of them only
+The template's security rests on eight decisions. Change any of them only
 deliberately, and update the regression tests in the same commit.
 
 ### 2.1 Sessions are the source of truth, not the token
@@ -137,7 +137,18 @@ Never add a tenant-scoped table without deciding, in the same commit, which
 membership level reads it and which one writes it. A scoping column that no code
 consults is worse than none, because the next reader will trust it.
 
-### 2.7 Untrusted input never picks its own bucket
+### 2.7 Storage backends never see an authorization decision
+
+`StorageService` owns validation — size caps, content sniffing, ownership and org
+membership — and hands a finished object to a `StorageBackend`. A backend only
+moves bytes. That split is why swapping local disk for S3 changes where files
+live without touching a single access check, and why the same generated-key
+allowlist that stops `../` on disk also stops key injection against a bucket.
+
+Never let a caller supply a storage key, and never put an authorization decision
+inside a backend.
+
+### 2.8 Untrusted input never picks its own bucket
 
 `X-Forwarded-For` is honoured only when `TRUST_PROXY_HEADERS=true`, because a
 caller who chooses their apparent IP also chooses their rate-limit bucket and the
@@ -242,6 +253,9 @@ without deleting its test, and do not delete its test.
 | Outsiders cannot upload into an organization | `outsiders_cannot_upload_into_an_organization` |
 | The org file listing is membership-gated | `org_file_listing_is_membership_gated` |
 | The notification org filter is membership-checked | `notification_org_filter_requires_membership` |
+| A backend rejects any key it did not generate | `s3_rejects_keys_that_are_not_generated` |
+| Objects round-trip through S3 unchanged | `s3_round_trips_an_object` |
+| Presigned URLs bypass this service | `s3_presigned_urls_point_at_object_storage` |
 
 ---
 
@@ -262,6 +276,7 @@ src/
 ├── models/                 # Request/response DTOs, row structs, pagination
 ├── routes/                 # health + v1/{auth,users,files,notifications,realtime,audit}
 ├── services/
+│   ├── storage_backend/    # StorageBackend trait + local disk and S3 impls
 │   ├── api_key.rs          # M2M key issuance, scoped resolution, throttled last-use
 │   ├── audit.rs            # Append-only audit trail
 │   ├── auth.rs             # Argon2id, sessions, recovery tokens, lockout
@@ -306,10 +321,6 @@ src/
 
 Recorded so nobody mistakes absence for oversight.
 
-- **S3/R2 storage backend.** `StorageBackend` is the seam and `LocalBackend` is
-  the only implementation. Local disk does not survive container replacement and
-  is invisible to other replicas, so a real deployment needs an S3 backend
-  written against this trait. Signed URLs and ACLs are already backend-agnostic.
 - **A fully declarative permission model.** Apps, organizations, `OrgRole`
   membership, and org-scoped files and notifications are implemented. What is not
   is a general permission grammar (`read("team:x:role")` applied uniformly to
