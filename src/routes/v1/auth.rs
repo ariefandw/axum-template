@@ -1,4 +1,4 @@
-﻿use std::sync::Arc;
+use std::sync::Arc;
 use axum::{
     extract::{Query, State},
     http::StatusCode,
@@ -155,6 +155,74 @@ pub async fn get_session(
 }
 
 #[utoipa::path(
+    post,
+    path = "/update-user",
+    request_body = crate::models::user::UpdateUserRequest,
+    responses(
+        (status = 200, description = "User profile updated (Better Auth alias)", body = ApiResponse<UserResponse>),
+        (status = 400, description = "Validation error", body = ApiErrorResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse)
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "Authentication"
+)]
+pub async fn update_user(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Json(payload): Json<crate::models::user::UpdateUserRequest>,
+) -> Result<Json<ApiResponse<UserResponse>>, AppError> {
+    payload.validate()?;
+    let updated = AuthService::update_profile(&state, auth_user.id, payload).await?;
+    Ok(Json(ApiResponse::success(updated)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/change-password",
+    request_body = crate::models::user::ChangePasswordRequest,
+    responses(
+        (status = 200, description = "Password changed (Better Auth alias)", body = ApiResponse<String>),
+        (status = 400, description = "Invalid password data", body = ApiErrorResponse),
+        (status = 401, description = "Incorrect current password", body = ApiErrorResponse)
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "Authentication"
+)]
+pub async fn change_password(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    Json(payload): Json<crate::models::user::ChangePasswordRequest>,
+) -> Result<Json<ApiResponse<String>>, AppError> {
+    payload.validate()?;
+    let msg = AuthService::change_password(&state, auth_user.id, payload).await?;
+    Ok(Json(ApiResponse::success(msg)))
+}
+
+#[utoipa::path(
+    post,
+    path = "/delete-user",
+    responses(
+        (status = 200, description = "Account deleted (Better Auth alias)", body = ApiResponse<String>),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse)
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "Authentication"
+)]
+pub async fn delete_user(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+) -> Result<Json<ApiResponse<String>>, AppError> {
+    let msg = AuthService::delete_account(&state, auth_user.id).await?;
+    Ok(Json(ApiResponse::success(msg)))
+}
+
+#[utoipa::path(
     get,
     path = "/sign-in/social/google",
     responses(
@@ -236,6 +304,9 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
         .routes(routes!(forget_password))
         .routes(routes!(reset_password))
         .routes(routes!(get_session))
+        .routes(routes!(update_user))
+        .routes(routes!(change_password))
+        .routes(routes!(delete_user))
         .routes(routes!(google_auth))
         .routes(routes!(google_callback))
         .routes(routes!(github_auth))
