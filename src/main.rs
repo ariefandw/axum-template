@@ -50,6 +50,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let app_state = Arc::new(AppState::new(pool, config.clone(), prometheus_handle));
 
+    // Fail fast on a misconfigured bucket, rather than on a user's first upload.
+    if let Err(e) = app_state.storage.check_ready().await {
+        tracing::error!("Storage backend is not usable: {e}");
+        return Err(e.into());
+    }
+    tracing::info!(backend = app_state.storage.name(), "Storage backend ready");
+
     // Bridge Postgres NOTIFY onto this replica's local broadcast channel, so SSE
     // clients receive events published by any replica.
     tokio::spawn(RealtimeService::run_listener(
@@ -141,6 +148,48 @@ async fn cleanup_loop(state: Arc<AppState>) {
                 Ok(_) => {}
                 Err(e) => tracing::warn!(table, error = %e, "Cleanup query failed"),
             }
+        }
+
+        // Presigned uploads that were reserved and never completed. This one
+        // needs the storage backend as well as the database, so it cannot be
+        // expressed as a plain statement above.
+        reap_abandoned_uploads(&state).await;
+    }
+}
+
+/// Clean up presigned uploads that were reserved and never completed.
+async fn reap_abandoned_uploads(state: &Arc<AppState>) {
+    // Twice the signed-URL lifetime, so a slow but legitimate upload is never
+    // reaped out from under a client that is still working.
+    let grace = state.config.signed_url_ttl_seconds * 2;
+
+    let stale = sqlx::query_as::<_, (uuid::Uuid, String)>(
+        "SELECT id, storage_key FROM files \
+         WHERE status = 'pending' AND deleted_at IS NULL \
+           AND created_at < now() - make_interval(secs => $1)",
+    )
+    .bind(grace as f64)
+    .fetch_all(&state.db)
+    .await;
+
+    let Ok(stale) = stale else {
+        if let Err(e) = stale {
+            tracing::warn!(error = %e, "Failed to query abandoned uploads");
+        }
+        return;
+    };
+
+    for (id, storage_key) in stale {
+        // Best effort: the object may never have been written at all.
+        let _ = state.storage.delete(&storage_key).await;
+        if let Err(e) = sqlx::query("UPDATE files SET deleted_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&state.db)
+            .await
+        {
+            tracing::warn!(file_id = %id, error = %e, "Failed to tombstone abandoned upload");
+        } else {
+            tracing::debug!(file_id = %id, "Reaped abandoned presigned upload");
         }
     }
 }

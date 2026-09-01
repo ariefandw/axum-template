@@ -19,7 +19,9 @@ dependency, and only when you scale past a single node.
   expiring upload and download URLs. Local disk and S3-compatible object storage
   sit behind one `StorageBackend` trait, selected by configuration; with S3,
   presigned URLs let clients upload and download without the bytes passing
-  through this service.
+  through this service. Direct uploads follow a reserve → upload → complete
+  flow, so an object always has an owning row and an abandoned upload is
+  reaped rather than orphaned.
 - **Realtime** — Server-Sent Events fanned out across replicas over PostgreSQL
   `LISTEN`/`NOTIFY`, with dropped events signalled to the client rather than
   silently discarded.

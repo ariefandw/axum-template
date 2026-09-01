@@ -255,7 +255,7 @@ impl StorageService {
 
         let files = sqlx::query_as::<_, FileRecord>(&format!(
             "SELECT {FILE_COLUMNS} FROM files \
-             WHERE org_id = $1 AND deleted_at IS NULL \
+             WHERE org_id = $1 AND deleted_at IS NULL AND status = 'ready' \
              ORDER BY created_at DESC LIMIT $2 OFFSET $3"
         ))
         .bind(org_id)
@@ -265,7 +265,8 @@ impl StorageService {
         .await?;
 
         let total = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM files WHERE org_id = $1 AND deleted_at IS NULL",
+            "SELECT COUNT(*) FROM files \
+             WHERE org_id = $1 AND deleted_at IS NULL AND status = 'ready'",
         )
         .bind(org_id)
         .fetch_one(&state.db)
@@ -276,7 +277,8 @@ impl StorageService {
 
     pub async fn load_record(state: &Arc<AppState>, file_id: Uuid) -> Result<FileRecord, AppError> {
         sqlx::query_as::<_, FileRecord>(&format!(
-            "SELECT {FILE_COLUMNS} FROM files WHERE id = $1 AND deleted_at IS NULL"
+            "SELECT {FILE_COLUMNS} FROM files \
+             WHERE id = $1 AND deleted_at IS NULL AND status = 'ready'"
         ))
         .bind(file_id)
         .fetch_optional(&state.db)
@@ -381,12 +383,16 @@ impl StorageService {
         format!("{method}\n{key}\n{expires_at}")
     }
 
-    /// Issue a signed, expiring grant to upload directly against a reserved key.
+    /// Reserve a key and issue a signed, expiring grant to upload against it.
     ///
-    /// With S3 this is a true direct-to-storage upload URL, which is the whole
-    /// point of presigning: a 100 MB file never passes through this process.
+    /// A `pending` row is created up front, so the object is owned before it
+    /// exists. Without it, a direct-to-storage upload produces an orphan: bytes
+    /// in the bucket that the API has no row for, cannot authorize, and cannot
+    /// delete. The client must call `complete_upload` afterwards.
     pub async fn generate_presigned_upload(
         state: &Arc<AppState>,
+        owner_id: Uuid,
+        org_id: Option<Uuid>,
         req: &PresignedUploadRequest,
     ) -> Result<PresignedUploadResponse, AppError> {
         let content_type = req.content_type.trim().to_ascii_lowercase();
@@ -402,39 +408,170 @@ impl StorageService {
             )));
         }
 
+        if let Some(org_id) = org_id {
+            OrgService::require_membership(state, org_id, owner_id).await?;
+        }
+
+        let visibility = normalize_visibility(req.visibility.as_deref().unwrap_or("private"))?;
         let file_id = Uuid::now_v7();
         let storage_key = format!("{file_id}.{}", Self::extension_for(&content_type));
-        let expires_at = Utc::now() + Duration::seconds(state.config.signed_url_ttl_seconds);
-        let signature = crypto::sign(
-            &state.config.url_signing_key,
-            &Self::signing_payload("PUT", &storage_key, expires_at.timestamp()),
-        );
+        let ttl = state.config.signed_url_ttl_seconds;
+        let expires_at = Utc::now() + Duration::seconds(ttl);
+
+        // The row is reserved before the URL is handed out, so an abandoned
+        // upload leaves a reapable record rather than an invisible object.
+        sqlx::query(
+            r#"
+            INSERT INTO files
+                (id, owner_id, org_id, bucket, storage_key, original_name, mime_type,
+                 size_bytes, visibility, status)
+            VALUES ($1, $2, $3, 'default', $4, $5, $6, 0, $7, 'pending')
+            "#,
+        )
+        .bind(file_id)
+        .bind(owner_id)
+        .bind(org_id)
+        .bind(&storage_key)
+        .bind(sanitize_filename(&req.filename))
+        .bind(&content_type)
+        .bind(visibility)
+        .execute(&state.db)
+        .await?;
 
         let base = state.config.public_base_url.trim_end_matches('/');
-        let upload_url = match state
+        let (upload_url, method) = match state
             .storage
-            .presign_put(
-                &storage_key,
-                &content_type,
-                state.config.signed_url_ttl_seconds,
-            )
+            .presign_put(&storage_key, &content_type, ttl)
             .await?
         {
-            Some(native) => native,
-            None => format!(
-                "{base}/api/v1/files/upload?key={storage_key}&expires={}&signature={signature}",
-                expires_at.timestamp()
-            ),
+            // Direct to object storage: the bytes never reach this service.
+            Some(native) => (native, "PUT"),
+            // No native presigning (local disk): serve a signed endpoint of our
+            // own so clients use one protocol across both backends.
+            None => {
+                let signature = crypto::sign(
+                    &state.config.url_signing_key,
+                    &Self::signing_payload("PUT", &storage_key, expires_at.timestamp()),
+                );
+                (
+                    format!(
+                        "{base}/api/v1/files/upload-signed?key={storage_key}\
+&expires={}&signature={signature}",
+                        expires_at.timestamp()
+                    ),
+                    "PUT",
+                )
+            }
         };
 
         Ok(PresignedUploadResponse {
+            file_id,
             upload_url,
+            method: method.to_string(),
             file_url: format!("{base}/api/v1/files/{file_id}"),
+            complete_url: format!("{base}/api/v1/files/{file_id}/complete"),
             storage_key,
             expires_at,
-            expires_in_seconds: state.config.signed_url_ttl_seconds,
+            expires_in_seconds: ttl,
             max_bytes: state.config.max_upload_bytes,
         })
+    }
+
+    /// Accept raw bytes against a signed upload grant, for backends that cannot
+    /// presign themselves. The signature is verified before anything is stored.
+    pub async fn accept_signed_upload(
+        state: &Arc<AppState>,
+        storage_key: &str,
+        expires: i64,
+        signature: &str,
+        body: &[u8],
+    ) -> Result<(), AppError> {
+        if !Self::verify_signature(state, "PUT", storage_key, expires, signature) {
+            return Err(AppError::Forbidden(
+                "Invalid or expired upload signature".to_string(),
+            ));
+        }
+        if body.len() as u64 > state.config.max_upload_bytes {
+            return Err(AppError::PayloadTooLarge(format!(
+                "Upload exceeds the {} byte limit",
+                state.config.max_upload_bytes
+            )));
+        }
+
+        // The signature binds the key, so the pending row it belongs to must
+        // exist and still be pending.
+        let mime: Option<String> = sqlx::query_scalar(
+            "SELECT mime_type FROM files \
+             WHERE storage_key = $1 AND status = 'pending' AND deleted_at IS NULL",
+        )
+        .bind(storage_key)
+        .fetch_optional(&state.db)
+        .await?;
+        let mime =
+            mime.ok_or_else(|| AppError::NotFound("No pending upload for this key".to_string()))?;
+
+        state.storage.put_bytes(storage_key, body, &mime).await
+    }
+
+    /// Confirm a presigned upload: verify the object is really in storage, take
+    /// its true size and type from there rather than from the client, and flip
+    /// the row to `ready`.
+    pub async fn complete_upload(
+        state: &Arc<AppState>,
+        file_id: Uuid,
+        actor_id: Uuid,
+        role: &str,
+    ) -> Result<FileRecord, AppError> {
+        let record = sqlx::query_as::<_, FileRecord>(&format!(
+            "SELECT {FILE_COLUMNS} FROM files WHERE id = $1 AND deleted_at IS NULL"
+        ))
+        .bind(file_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("File not found".to_string()))?;
+
+        Self::authorize_write(state, &record, actor_id, role).await?;
+
+        if record.status == "ready" {
+            // Idempotent: completing twice is a normal client retry.
+            return Ok(record);
+        }
+
+        // The client controls neither the size nor the type that get recorded.
+        let meta = state.storage.head(&record.storage_key).await.map_err(|_| {
+            AppError::BadRequest(
+                "No uploaded object found for this reservation. Upload the bytes first."
+                    .to_string(),
+            )
+        })?;
+
+        if meta.len == 0 {
+            return Err(AppError::BadRequest("Uploaded object is empty".to_string()));
+        }
+        if meta.len > state.config.max_upload_bytes {
+            // Refuse it and remove the oversized object rather than adopting it.
+            let _ = state.storage.delete(&record.storage_key).await;
+            sqlx::query("UPDATE files SET deleted_at = now() WHERE id = $1")
+                .bind(file_id)
+                .execute(&state.db)
+                .await?;
+            return Err(AppError::PayloadTooLarge(format!(
+                "Uploaded object is {} bytes, over the {} byte limit",
+                meta.len, state.config.max_upload_bytes
+            )));
+        }
+
+        let updated = sqlx::query_as::<_, FileRecord>(&format!(
+            "UPDATE files SET status = 'ready', size_bytes = $2 \
+             WHERE id = $1 AND status = 'pending' RETURNING {FILE_COLUMNS}"
+        ))
+        .bind(file_id)
+        .bind(meta.len as i64)
+        .fetch_optional(&state.db)
+        .await?
+        .unwrap_or(record);
+
+        Ok(updated)
     }
 
     /// Issue a signed, expiring download URL for a private file, so it can be

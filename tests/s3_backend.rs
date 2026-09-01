@@ -20,7 +20,7 @@ mod common;
 use std::path::PathBuf;
 
 use axum_template::{
-    config::{AppConfig, S3Config, StorageBackendKind},
+    config::{AppConfig, S3Config},
     services::storage_backend::{S3Backend, StorageBackend},
 };
 use tokio::io::AsyncWriteExt;
@@ -32,13 +32,8 @@ fn s3_from_env() -> Option<S3Config> {
     if std::env::var("STORAGE_BACKEND").ok().as_deref() != Some("s3") {
         return None;
     }
-    let mut cfg = AppConfig::for_testing("postgres://unused");
-    cfg.storage_backend = StorageBackendKind::S3;
     // Reuse the real loader so the test exercises the same parsing production does.
-    match AppConfig::load_from_env() {
-        Ok(loaded) => loaded.s3,
-        Err(_) => None,
-    }
+    AppConfig::load_from_env().ok().and_then(|loaded| loaded.s3)
 }
 
 macro_rules! skip_without_s3 {

@@ -23,6 +23,13 @@ pub mod s3;
 pub use local::LocalBackend;
 pub use s3::S3Backend;
 
+/// What a backend knows about an object without transferring it.
+#[derive(Debug, Clone)]
+pub struct ObjectMeta {
+    pub len: u64,
+    pub content_type: Option<String>,
+}
+
 /// A stored object opened for reading.
 pub struct StoredObject {
     pub stream: Pin<Box<dyn Stream<Item = Result<Bytes, std::io::Error>> + Send>>,
@@ -34,6 +41,13 @@ pub trait StorageBackend: Send + Sync {
     /// Human-readable name, for startup logging and diagnostics.
     fn name(&self) -> &'static str;
 
+    /// Confirm the backend is usable before the server accepts traffic, so a bad
+    /// bucket or wrong credentials surface at startup rather than on a user's
+    /// first upload.
+    async fn check_ready(&self) -> Result<(), AppError> {
+        Ok(())
+    }
+
     /// Persist a finished, already-validated file.
     async fn put_file(
         &self,
@@ -43,6 +57,25 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<(), AppError>;
 
     async fn open(&self, key: &str) -> Result<StoredObject, AppError>;
+
+    /// Size and content type without transferring the body.
+    ///
+    /// Used to confirm a presigned upload actually landed, and to learn its real
+    /// size rather than trusting what the client declared.
+    async fn head(&self, key: &str) -> Result<ObjectMeta, AppError>;
+
+    /// Persist raw bytes. Backends that only receive uploads through their own
+    /// presigned URLs may leave this unimplemented.
+    async fn put_bytes(
+        &self,
+        _key: &str,
+        _bytes: &[u8],
+        _content_type: &str,
+    ) -> Result<(), AppError> {
+        Err(AppError::BadRequest(
+            "This storage backend does not accept uploads through the API".to_string(),
+        ))
+    }
 
     async fn delete(&self, key: &str) -> Result<(), AppError>;
 

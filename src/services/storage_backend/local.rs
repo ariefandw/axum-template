@@ -12,7 +12,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::error::AppError;
 
-use super::{StorageBackend, StoredObject, local_path_for};
+use super::{ObjectMeta, StorageBackend, StoredObject, local_path_for};
 
 pub struct LocalBackend {
     root: PathBuf,
@@ -32,6 +32,15 @@ impl LocalBackend {
 impl StorageBackend for LocalBackend {
     fn name(&self) -> &'static str {
         "local"
+    }
+
+    async fn check_ready(&self) -> Result<(), AppError> {
+        fs::create_dir_all(&self.root).await.map_err(|e| {
+            AppError::ServiceUnavailable(format!(
+                "Upload directory {} is not writable: {e}",
+                self.root.display()
+            ))
+        })
     }
 
     async fn put_file(
@@ -69,6 +78,34 @@ impl StorageBackend for LocalBackend {
             stream: Box::pin(ReaderStream::new(file)),
             len,
         })
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, AppError> {
+        let path = local_path_for(&self.root, key)?;
+        let meta = fs::metadata(&path)
+            .await
+            .map_err(|_| AppError::NotFound("File not found".to_string()))?;
+        Ok(ObjectMeta {
+            len: meta.len(),
+            // The filesystem stores no content type; the caller sniffs instead.
+            content_type: None,
+        })
+    }
+
+    /// Persist raw bytes, for the signed direct-upload endpoint.
+    async fn put_bytes(
+        &self,
+        key: &str,
+        bytes: &[u8],
+        _content_type: &str,
+    ) -> Result<(), AppError> {
+        let dest = local_path_for(&self.root, key)?;
+        fs::create_dir_all(&self.root)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to create upload dir: {e}").into()))?;
+        fs::write(&dest, bytes)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to store file: {e}").into()))
     }
 
     async fn delete(&self, key: &str) -> Result<(), AppError> {

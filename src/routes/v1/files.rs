@@ -129,8 +129,92 @@ pub async fn create_presigned_url(
 ) -> Result<Json<ApiResponse<PresignedUploadResponse>>, AppError> {
     auth_user.require_scope(ApiScope::FilesWrite)?;
     payload.validate()?;
-    let res = StorageService::generate_presigned_upload(&state, &payload).await?;
+    let res =
+        StorageService::generate_presigned_upload(&state, auth_user.id, payload.org_id, &payload)
+            .await?;
     Ok(Json(ApiResponse::success(res)))
+}
+
+/// Receive bytes against a signed upload grant.
+///
+/// Used by backends that cannot presign natively (local disk), so a client
+/// speaks one presigned-upload protocol regardless of where bytes end up. The
+/// signature is the credential here: it names the key and carries an expiry, so
+/// no bearer token is required.
+#[utoipa::path(
+    put, path = "/upload-signed",
+    params(SignedAccessQuery),
+    request_body(
+        content = String,
+        description = "Raw file bytes",
+        content_type = "application/octet-stream"
+    ),
+    responses(
+        (status = 200, description = "Bytes stored against the reservation", body = ApiResponse<String>),
+        (status = 403, description = "Invalid or expired signature", body = ApiErrorResponse),
+        (status = 404, description = "No pending upload for this key", body = ApiErrorResponse),
+        (status = 413, description = "Upload exceeds the size limit", body = ApiErrorResponse)
+    ),
+    tag = "Storage"
+)]
+pub async fn upload_signed(
+    State(state): State<Arc<AppState>>,
+    Query(signed): Query<SignedAccessQuery>,
+    body: axum::body::Bytes,
+) -> Result<Json<ApiResponse<String>>, AppError> {
+    let (Some(key), Some(expires), Some(signature)) = (
+        signed.key.as_deref(),
+        signed.expires,
+        signed.signature.as_deref(),
+    ) else {
+        return Err(AppError::BadRequest(
+            "key, expires and signature are all required".to_string(),
+        ));
+    };
+
+    StorageService::accept_signed_upload(&state, key, expires, signature, &body).await?;
+    Ok(Json(ApiResponse::success(
+        "Upload stored. Call the complete endpoint to finish.".to_string(),
+    )))
+}
+
+/// Confirm a presigned upload.
+///
+/// Verifies the object is really in storage and records its true size, then
+/// makes the file readable. Until this is called the reservation is invisible to
+/// every read path, and it is eventually reaped.
+#[utoipa::path(
+    post, path = "/{id}/complete",
+    params(("id" = Uuid, Path, description = "File ID from the presigned response")),
+    responses(
+        (status = 200, description = "Upload confirmed and now readable", body = ApiResponse<UploadResponse>),
+        (status = 400, description = "No uploaded object found for this reservation", body = ApiErrorResponse),
+        (status = 404, description = "Reservation not found or not yours", body = ApiErrorResponse),
+        (status = 413, description = "Uploaded object is over the size limit", body = ApiErrorResponse)
+    ),
+    security(("bearer_auth" = [])), tag = "Storage"
+)]
+pub async fn complete_upload(
+    State(state): State<Arc<AppState>>,
+    auth_user: AuthUser,
+    ctx: RequestContext,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApiResponse<UploadResponse>>, AppError> {
+    auth_user.require_scope(ApiScope::FilesWrite)?;
+    let record = StorageService::complete_upload(&state, id, auth_user.id, &auth_user.role).await?;
+
+    AuditService::record_best_effort(
+        &state,
+        Some(auth_user.id),
+        "file.upload_completed",
+        "file",
+        Some(&record.id.to_string()),
+        &ctx,
+        Some(serde_json::json!({ "size_bytes": record.size_bytes, "org_id": record.org_id })),
+    )
+    .await;
+
+    Ok(Json(ApiResponse::success(record.into())))
 }
 
 #[utoipa::path(
@@ -317,6 +401,8 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
         .routes(routes!(upload_file))
         .routes(routes!(create_presigned_url))
+        .routes(routes!(upload_signed))
+        .routes(routes!(complete_upload))
         .routes(routes!(create_signed_download_url))
         .routes(routes!(list_org_files))
         .routes(routes!(get_file))

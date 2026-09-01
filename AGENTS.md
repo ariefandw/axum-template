@@ -52,7 +52,7 @@ incomplete work.
 
 ## 2. Security model
 
-The template's security rests on eight decisions. Change any of them only
+The template's security rests on nine decisions. Change any of them only
 deliberately, and update the regression tests in the same commit.
 
 ### 2.1 Sessions are the source of truth, not the token
@@ -148,7 +148,26 @@ allowlist that stops `../` on disk also stops key injection against a bucket.
 Never let a caller supply a storage key, and never put an authorization decision
 inside a backend.
 
-### 2.8 Untrusted input never picks its own bucket
+### 2.8 An object nothing points at is an orphan
+
+A presigned upload writes bytes straight to storage, so the API never sees them.
+That makes the row, not the object, the thing that must come first:
+
+1. `POST /files/presigned-url` reserves a `pending` row and returns the grant.
+2. The client uploads — direct to S3, or to `PUT /files/upload-signed` when the
+   backend cannot presign. The signature is the credential there; no bearer
+   token is involved, so it is verified before a single byte is stored.
+3. `POST /files/{id}/complete` confirms the object really exists, takes its true
+   size from storage rather than from the client, and flips the row to `ready`.
+
+Pending rows are invisible to every read path and are reaped after twice the
+signed-URL lifetime. Skipping step 1 leaves an object in the bucket that no row
+owns: unauthorizable, unreachable through the API, and impossible to delete
+through it.
+
+Never hand out an upload URL for a key you have not reserved.
+
+### 2.9 Untrusted input never picks its own bucket
 
 `X-Forwarded-For` is honoured only when `TRUST_PROXY_HEADERS=true`, because a
 caller who chooses their apparent IP also chooses their rate-limit bucket and the
@@ -256,6 +275,11 @@ without deleting its test, and do not delete its test.
 | A backend rejects any key it did not generate | `s3_rejects_keys_that_are_not_generated` |
 | Objects round-trip through S3 unchanged | `s3_round_trips_an_object` |
 | Presigned URLs bypass this service | `s3_presigned_urls_point_at_object_storage` |
+| A presigned upload becomes a real, owned, readable file | `presigned_upload_round_trips_and_becomes_readable` |
+| A pending reservation is invisible until completed | `completing_without_uploading_is_refused` |
+| Only the reserver may complete an upload | `a_stranger_cannot_complete_someone_elses_reservation` |
+| A forged or extended upload grant is refused | `signed_upload_rejects_a_tampered_grant` |
+| Abandoned reservations are reaped, completed files never | `abandoned_reservations_are_reapable` |
 
 ---
 

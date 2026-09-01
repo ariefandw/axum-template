@@ -1601,6 +1601,106 @@
         ]
       }
     },
+    "/api/v1/files/upload-signed": {
+      "put": {
+        "tags": [
+          "Storage"
+        ],
+        "summary": "Receive bytes against a signed upload grant.",
+        "description": "Used by backends that cannot presign natively (local disk), so a client\nspeaks one presigned-upload protocol regardless of where bytes end up. The\nsignature is the credential here: it names the key and carries an expiry, so\nno bearer token is required.",
+        "operationId": "upload_signed",
+        "parameters": [
+          {
+            "name": "expires",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "signature",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "description": "Reserved key, present on presigned upload URLs.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "Raw file bytes",
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Bytes stored against the reservation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse_String"
+                }
+              }
+            }
+          },
+          "403": {
+            "description": "Invalid or expired signature",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "No pending upload for this key",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Upload exceeds the size limit",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/files/{id}": {
       "get": {
         "tags": [
@@ -1705,6 +1805,75 @@
           },
           "404": {
             "description": "File not found or not yours",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/files/{id}/complete": {
+      "post": {
+        "tags": [
+          "Storage"
+        ],
+        "summary": "Confirm a presigned upload.",
+        "description": "Verifies the object is really in storage and records its true size, then\nmakes the file readable. Until this is called the reservation is invisible to\nevery read path, and it is eventually reaped.",
+        "operationId": "complete_upload",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "File ID from the presigned response",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Upload confirmed and now readable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse_UploadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "No uploaded object found for this reservation",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Reservation not found or not yours",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "Uploaded object is over the size limit",
             "content": {
               "application/json": {
                 "schema": {
@@ -2682,14 +2851,21 @@
             "type": "object",
             "description": "A genuinely signed upload grant. The previous implementation returned a static\npath with no signature and an advertised expiry that nothing enforced.",
             "required": [
+              "file_id",
               "storage_key",
               "upload_url",
               "file_url",
+              "complete_url",
+              "method",
               "expires_at",
               "expires_in_seconds",
               "max_bytes"
             ],
             "properties": {
+              "complete_url": {
+                "type": "string",
+                "description": "Call this after the upload finishes, or the reservation is reaped and the\nobject becomes unreachable."
+              },
               "expires_at": {
                 "type": "string",
                 "format": "date-time"
@@ -2698,6 +2874,11 @@
                 "type": "integer",
                 "format": "int64"
               },
+              "file_id": {
+                "type": "string",
+                "format": "uuid",
+                "description": "The reserved file. A row already exists in `pending` state; call\n`POST /files/{id}/complete` once the bytes are uploaded."
+              },
               "file_url": {
                 "type": "string"
               },
@@ -2705,6 +2886,10 @@
                 "type": "integer",
                 "format": "int64",
                 "minimum": 0
+              },
+              "method": {
+                "type": "string",
+                "description": "`PUT` for a direct-to-storage URL, `POST` for the multipart fallback."
               },
               "storage_key": {
                 "type": "string"
@@ -3645,6 +3830,7 @@
           "mime_type",
           "size_bytes",
           "visibility",
+          "status",
           "created_at"
         ],
         "properties": {
@@ -3689,6 +3875,10 @@
           "size_bytes": {
             "type": "integer",
             "format": "int64"
+          },
+          "status": {
+            "type": "string",
+            "description": "`pending` until a presigned upload is confirmed present in storage.\nReads only ever return `ready` rows."
           },
           "storage_key": {
             "type": "string"
@@ -3970,6 +4160,14 @@
           "filename": {
             "type": "string"
           },
+          "org_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid",
+            "description": "Attribute the upload to an organization. Membership is verified before\nthe reservation is made."
+          },
           "size_bytes": {
             "type": [
               "integer",
@@ -3991,14 +4189,21 @@
         "type": "object",
         "description": "A genuinely signed upload grant. The previous implementation returned a static\npath with no signature and an advertised expiry that nothing enforced.",
         "required": [
+          "file_id",
           "storage_key",
           "upload_url",
           "file_url",
+          "complete_url",
+          "method",
           "expires_at",
           "expires_in_seconds",
           "max_bytes"
         ],
         "properties": {
+          "complete_url": {
+            "type": "string",
+            "description": "Call this after the upload finishes, or the reservation is reaped and the\nobject becomes unreachable."
+          },
           "expires_at": {
             "type": "string",
             "format": "date-time"
@@ -4007,6 +4212,11 @@
             "type": "integer",
             "format": "int64"
           },
+          "file_id": {
+            "type": "string",
+            "format": "uuid",
+            "description": "The reserved file. A row already exists in `pending` state; call\n`POST /files/{id}/complete` once the bytes are uploaded."
+          },
           "file_url": {
             "type": "string"
           },
@@ -4014,6 +4224,10 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "method": {
+            "type": "string",
+            "description": "`PUT` for a direct-to-storage URL, `POST` for the multipart fallback."
           },
           "storage_key": {
             "type": "string"

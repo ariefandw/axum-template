@@ -23,11 +23,15 @@ pub struct FileRecord {
     pub size_bytes: i64,
     pub checksum_sha256: Option<String>,
     pub visibility: String,
+    /// `pending` until a presigned upload is confirmed present in storage.
+    /// Reads only ever return `ready` rows.
+    pub status: String,
     pub created_at: DateTime<Utc>,
 }
 
 pub const FILE_COLUMNS: &str = "id, owner_id, org_id, bucket, storage_key, original_name, \
-                                mime_type, size_bytes, checksum_sha256, visibility, created_at";
+                                mime_type, size_bytes, checksum_sha256, visibility, status, \
+                                created_at";
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UploadResponse {
@@ -67,16 +71,27 @@ pub struct PresignedUploadRequest {
     pub size_bytes: Option<u64>,
     /// `private` (default) or `public`.
     pub visibility: Option<String>,
+    /// Attribute the upload to an organization. Membership is verified before
+    /// the reservation is made.
+    pub org_id: Option<Uuid>,
 }
 
 /// A genuinely signed upload grant. The previous implementation returned a static
 /// path with no signature and an advertised expiry that nothing enforced.
 #[derive(Debug, Serialize, ToSchema)]
 pub struct PresignedUploadResponse {
+    /// The reserved file. A row already exists in `pending` state; call
+    /// `POST /files/{id}/complete` once the bytes are uploaded.
+    pub file_id: Uuid,
     pub storage_key: String,
     /// Absolute URL carrying the signature and expiry as query parameters.
     pub upload_url: String,
     pub file_url: String,
+    /// Call this after the upload finishes, or the reservation is reaped and the
+    /// object becomes unreachable.
+    pub complete_url: String,
+    /// `PUT` for a direct-to-storage URL, `POST` for the multipart fallback.
+    pub method: String,
     pub expires_at: DateTime<Utc>,
     pub expires_in_seconds: i64,
     pub max_bytes: u64,

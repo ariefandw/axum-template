@@ -23,7 +23,7 @@ use tokio_util::io::ReaderStream;
 
 use crate::{config::S3Config, error::AppError};
 
-use super::{StorageBackend, StoredObject, validate_storage_key};
+use super::{ObjectMeta, StorageBackend, StoredObject, validate_storage_key};
 
 pub struct S3Backend {
     client: Client,
@@ -79,8 +79,7 @@ impl S3Backend {
             .map_err(|e| AppError::Internal(format!("Invalid presigning config: {e}").into()))
     }
 
-    /// Verify the bucket is reachable and the credentials work, so a
-    /// misconfiguration surfaces at startup rather than on a user's first upload.
+    /// Verify the bucket is reachable and the credentials work.
     pub async fn check_connectivity(&self) -> Result<(), AppError> {
         self.client
             .head_bucket()
@@ -106,6 +105,10 @@ impl S3Backend {
 impl StorageBackend for S3Backend {
     fn name(&self) -> &'static str {
         "s3"
+    }
+
+    async fn check_ready(&self) -> Result<(), AppError> {
+        self.check_connectivity().await
     }
 
     async fn put_file(
@@ -161,6 +164,40 @@ impl StorageBackend for S3Backend {
             stream: Box::pin(ReaderStream::new(reader)),
             len,
         })
+    }
+
+    async fn head(&self, key: &str) -> Result<ObjectMeta, AppError> {
+        let object_key = self.object_key(key)?;
+        let output = self
+            .client
+            .head_object()
+            .bucket(&self.bucket)
+            .key(&object_key)
+            .send()
+            .await
+            .map_err(|_| AppError::NotFound("File not found".to_string()))?;
+
+        Ok(ObjectMeta {
+            len: output.content_length().unwrap_or(0).max(0) as u64,
+            content_type: output.content_type().map(str::to_string),
+        })
+    }
+
+    async fn put_bytes(&self, key: &str, bytes: &[u8], content_type: &str) -> Result<(), AppError> {
+        let object_key = self.object_key(key)?;
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(&object_key)
+            .content_type(content_type)
+            .body(ByteStream::from(bytes.to_vec()))
+            .send()
+            .await
+            .map_err(|e| {
+                tracing::error!(key = %object_key, error = ?e, "S3 put_object failed");
+                AppError::Internal("Failed to store object".into())
+            })?;
+        Ok(())
     }
 
     async fn delete(&self, key: &str) -> Result<(), AppError> {
