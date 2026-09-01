@@ -1,20 +1,15 @@
-﻿use std::{path::Path, sync::Arc};
+use std::path::Path;
+use std::sync::Arc;
 use axum::extract::multipart::Field;
-use tokio::{fs, io::AsyncWriteExt};
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use crate::{error::AppError, models::upload::UploadResponse, state::AppState};
-
-const MAX_FILE_SIZE_BYTES: usize = 10 * 1024 * 1024; // 10MB
-const ALLOWED_MIME_TYPES: &[&str] = &[
-    "image/jpeg",
-    "image/png",
-    "image/webp",
-    "image/gif",
-    "application/pdf",
-    "text/plain",
-    "application/json",
-];
+use crate::{
+    error::AppError,
+    models::upload::{PresignedUploadRequest, PresignedUploadResponse, UploadResponse},
+    state::AppState,
+};
 
 pub struct StorageService;
 
@@ -23,84 +18,110 @@ impl StorageService {
         state: &Arc<AppState>,
         mut field: Field<'_>,
     ) -> Result<UploadResponse, AppError> {
-        let original_filename = field
+        let original_name = field
             .file_name()
-            .unwrap_or("unknown_file")
+            .unwrap_or("unnamed_file")
             .to_string();
 
-        let content_type = field
-            .content_type()
-            .unwrap_or("application/octet-stream")
-            .to_string();
-
-        // 1. MIME Validation
-        if !ALLOWED_MIME_TYPES.contains(&content_type.as_str()) {
-            return Err(AppError::BadRequest(format!(
-                "Unsupported file type '{content_type}'. Allowed types: jpeg, png, webp, gif, pdf, txt, json"
-            )));
-        }
-
-        // 2. Extract safe extension
-        let extension = Path::new(&original_filename)
+        let ext = Path::new(&original_name)
             .extension()
-            .and_then(|ext| ext.to_str())
-            .unwrap_or("bin");
+            .and_then(|e| e.to_str())
+            .unwrap_or("bin")
+            .to_lowercase();
 
         let file_id = Uuid::now_v7();
-        let stored_filename = format!("{file_id}.{extension}");
-        let upload_dir = &state.config.upload_dir;
+        let stored_filename = format!("{file_id}.{ext}");
 
-        // 3. Ensure target directory exists
-        fs::create_dir_all(upload_dir).await.map_err(|e| {
-            AppError::Internal(format!("Failed to create upload directory: {e}").into())
-        })?;
+        fs::create_dir_all(&state.config.upload_dir)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to create upload dir: {e}").into()))?;
 
-        let destination_path = format!("{upload_dir}/{stored_filename}");
-        let mut file = fs::File::create(&destination_path).await.map_err(|e| {
-            AppError::Internal(format!("Failed to create destination file: {e}").into())
-        })?;
+        let dest_path = format!("{}/{}", state.config.upload_dir, stored_filename);
+        let mut file = fs::File::create(&dest_path)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to create file: {e}").into()))?;
 
-        let mut total_bytes = 0;
+        let mut total_bytes: u64 = 0;
+        const MAX_BYTES: u64 = 10 * 1024 * 1024; // 10MB Limit
 
-        // 4. Stream chunks directly to disk with bounded memory
-        while let Some(chunk) = field.chunk().await.map_err(|e| {
-            AppError::BadRequest(format!("Failed to read multipart chunk: {e}"))
-        })? {
-            total_bytes += chunk.len();
-            if total_bytes > MAX_FILE_SIZE_BYTES {
-                // Delete partial file on limit violation
-                let _ = fs::remove_file(&destination_path).await;
-                return Err(AppError::BadRequest(format!(
-                    "File exceeds maximum allowed size of {} MB",
-                    MAX_FILE_SIZE_BYTES / (1024 * 1024)
-                )));
+        while let Some(chunk) = field
+            .chunk()
+            .await
+            .map_err(|e| AppError::BadRequest(format!("Failed to read chunk: {e}")))?
+        {
+            total_bytes += chunk.len() as u64;
+            if total_bytes > MAX_BYTES {
+                drop(file);
+                let _ = fs::remove_file(&dest_path).await;
+                return Err(AppError::BadRequest("File exceeds 10MB limit".to_string()));
             }
 
-            file.write_all(&chunk).await.map_err(|e| {
-                AppError::Internal(format!("Failed to write chunk to disk: {e}").into())
-            })?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to write chunk: {e}").into()))?;
         }
 
-        file.flush().await.map_err(|e| {
-            AppError::Internal(format!("Failed to flush file to disk: {e}").into())
-        })?;
-
-        let url = format!("/api/v1/files/{stored_filename}");
-
-        tracing::info!(
-            file_id = %file_id,
-            filename = %original_filename,
-            size = total_bytes,
-            "File uploaded successfully"
-        );
+        let mime_type = match ext.as_str() {
+            "jpg" | "jpeg" => "image/jpeg",
+            "png" => "image/png",
+            "webp" => "image/webp",
+            "gif" => "image/gif",
+            "pdf" => "application/pdf",
+            "txt" => "text/plain",
+            "json" => "application/json",
+            _ => "application/octet-stream",
+        };
 
         Ok(UploadResponse {
-            id: file_id,
-            original_filename,
-            stored_filename,
-            content_type,
+            id: file_id.to_string(),
+            filename: stored_filename.clone(),
+            original_name,
             size_bytes: total_bytes,
-            url,
+            mime_type: mime_type.to_string(),
+            url: format!("/api/v1/files/{stored_filename}"),
+        })
+    }
+
+    pub async fn delete_file(
+        state: &Arc<AppState>,
+        filename: &str,
+    ) -> Result<String, AppError> {
+        if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
+            return Err(AppError::BadRequest("Invalid filename".to_string()));
+        }
+
+        let file_path = format!("{}/{}", state.config.upload_dir, filename);
+        if !fs::try_exists(&file_path).await.unwrap_or(false) {
+            return Err(AppError::NotFound(format!("File '{filename}' not found")));
+        }
+
+        fs::remove_file(&file_path)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to delete file: {e}").into()))?;
+
+        Ok(format!("File '{filename}' deleted successfully"))
+    }
+
+    pub fn generate_presigned_url(
+        _state: &Arc<AppState>,
+        req: PresignedUploadRequest,
+    ) -> Result<PresignedUploadResponse, AppError> {
+        let file_id = Uuid::now_v7();
+        let ext = Path::new(&req.filename)
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("bin")
+            .to_lowercase();
+
+        let key = format!("{file_id}.{ext}");
+        let upload_url = format!("/api/v1/files/upload"); // In S3/R2 mode, this would be an AWS SigV4 signed URL
+        let file_url = format!("/api/v1/files/{key}");
+
+        Ok(PresignedUploadResponse {
+            key,
+            upload_url,
+            file_url,
+            expires_in_seconds: 900, // 15 mins
         })
     }
 }

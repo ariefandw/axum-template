@@ -8,11 +8,12 @@ use axum::{
 use tokio::fs;
 use tokio_util::io::ReaderStream;
 use utoipa_axum::{router::OpenApiRouter, routes};
+use validator::Validate;
 
 use crate::{
     error::{ApiErrorResponse, ApiResponse, AppError},
     middleware::auth::AuthUser,
-    models::upload::UploadResponse,
+    models::upload::{PresignedUploadRequest, PresignedUploadResponse, UploadResponse},
     services::storage::StorageService,
     state::AppState,
 };
@@ -47,6 +48,30 @@ pub async fn upload_file(
     }
 
     Err(AppError::BadRequest("Missing 'file' multipart field".to_string()))
+}
+
+#[utoipa::path(
+    post,
+    path = "/presigned-url",
+    request_body = PresignedUploadRequest,
+    responses(
+        (status = 200, description = "Presigned direct upload URL generated", body = ApiResponse<PresignedUploadResponse>),
+        (status = 400, description = "Validation error", body = ApiErrorResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse)
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "Storage"
+)]
+pub async fn create_presigned_url(
+    State(state): State<Arc<AppState>>,
+    _auth_user: AuthUser,
+    Json(payload): Json<PresignedUploadRequest>,
+) -> Result<Json<ApiResponse<PresignedUploadResponse>>, AppError> {
+    payload.validate()?;
+    let res = StorageService::generate_presigned_url(&state, payload)?;
+    Ok(Json(ApiResponse::success(res)))
 }
 
 #[utoipa::path(
@@ -88,8 +113,35 @@ pub async fn get_file(
     Ok(response)
 }
 
+#[utoipa::path(
+    delete,
+    path = "/{filename}",
+    params(
+        ("filename" = String, Path, description = "Stored filename (e.g. uuid.png)")
+    ),
+    responses(
+        (status = 200, description = "File deleted successfully", body = ApiResponse<String>),
+        (status = 404, description = "File not found", body = ApiErrorResponse),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse)
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "Storage"
+)]
+pub async fn delete_file(
+    State(state): State<Arc<AppState>>,
+    _auth_user: AuthUser,
+    Path(filename): Path<String>,
+) -> Result<Json<ApiResponse<String>>, AppError> {
+    let msg = StorageService::delete_file(&state, &filename).await?;
+    Ok(Json(ApiResponse::success(msg)))
+}
+
 pub fn router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
         .routes(routes!(upload_file))
+        .routes(routes!(create_presigned_url))
         .routes(routes!(get_file))
+        .routes(routes!(delete_file))
 }

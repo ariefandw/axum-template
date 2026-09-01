@@ -622,6 +622,61 @@
         }
       }
     },
+    "/api/v1/files/presigned-url": {
+      "post": {
+        "tags": [
+          "Storage"
+        ],
+        "operationId": "create_presigned_url",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/PresignedUploadRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Presigned direct upload URL generated",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse_PresignedUploadResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Validation error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/files/upload": {
       "post": {
         "tags": [
@@ -702,6 +757,60 @@
             }
           }
         }
+      },
+      "delete": {
+        "tags": [
+          "Storage"
+        ],
+        "operationId": "delete_file",
+        "parameters": [
+          {
+            "name": "filename",
+            "in": "path",
+            "description": "Stored filename (e.g. uuid.png)",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "File deleted successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse_String"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Unauthorized",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "File not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
       }
     },
     "/api/v1/notifications": {
@@ -1287,6 +1396,45 @@
           }
         }
       },
+      "ApiResponse_PresignedUploadResponse": {
+        "type": "object",
+        "description": "Standardized Success Envelope",
+        "required": [
+          "success",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "key",
+              "upload_url",
+              "file_url",
+              "expires_in_seconds"
+            ],
+            "properties": {
+              "expires_in_seconds": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "file_url": {
+                "type": "string"
+              },
+              "key": {
+                "type": "string"
+              },
+              "upload_url": {
+                "type": "string"
+              }
+            }
+          },
+          "meta": {},
+          "success": {
+            "type": "boolean"
+          }
+        }
+      },
       "ApiResponse_String": {
         "type": "object",
         "description": "Standardized Success Envelope",
@@ -1316,29 +1464,29 @@
             "type": "object",
             "required": [
               "id",
-              "original_filename",
-              "stored_filename",
-              "content_type",
+              "filename",
+              "original_name",
               "size_bytes",
+              "mime_type",
               "url"
             ],
             "properties": {
-              "content_type": {
+              "filename": {
                 "type": "string"
               },
               "id": {
-                "type": "string",
-                "format": "uuid"
+                "type": "string"
               },
-              "original_filename": {
+              "mime_type": {
+                "type": "string"
+              },
+              "original_name": {
                 "type": "string"
               },
               "size_bytes": {
                 "type": "integer",
+                "format": "int64",
                 "minimum": 0
-              },
-              "stored_filename": {
-                "type": "string"
               },
               "url": {
                 "type": "string"
@@ -1884,6 +2032,54 @@
           }
         }
       },
+      "PresignedUploadRequest": {
+        "type": "object",
+        "required": [
+          "filename",
+          "content_type"
+        ],
+        "properties": {
+          "content_type": {
+            "type": "string"
+          },
+          "filename": {
+            "type": "string"
+          },
+          "size_bytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
+      "PresignedUploadResponse": {
+        "type": "object",
+        "required": [
+          "key",
+          "upload_url",
+          "file_url",
+          "expires_in_seconds"
+        ],
+        "properties": {
+          "expires_in_seconds": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "file_url": {
+            "type": "string"
+          },
+          "key": {
+            "type": "string"
+          },
+          "upload_url": {
+            "type": "string"
+          }
+        }
+      },
       "RealtimeEvent": {
         "type": "object",
         "required": [
@@ -1990,29 +2186,29 @@
         "type": "object",
         "required": [
           "id",
-          "original_filename",
-          "stored_filename",
-          "content_type",
+          "filename",
+          "original_name",
           "size_bytes",
+          "mime_type",
           "url"
         ],
         "properties": {
-          "content_type": {
+          "filename": {
             "type": "string"
           },
           "id": {
-            "type": "string",
-            "format": "uuid"
+            "type": "string"
           },
-          "original_filename": {
+          "mime_type": {
+            "type": "string"
+          },
+          "original_name": {
             "type": "string"
           },
           "size_bytes": {
             "type": "integer",
+            "format": "int64",
             "minimum": 0
-          },
-          "stored_filename": {
-            "type": "string"
           },
           "url": {
             "type": "string"

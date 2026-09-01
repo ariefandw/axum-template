@@ -14,8 +14,8 @@ use axum_template::{
     state::AppState,
 };
 
-// Helper to create test app state with mock DB pool
-async fn setup_test_app() -> axum::Router {
+// Helper to create test app state
+async fn setup_test_app() -> (axum::Router, Arc<AppState>) {
     dotenvy::dotenv().ok();
 
     let prometheus_handle = PrometheusBuilder::new()
@@ -46,17 +46,16 @@ async fn setup_test_app() -> axum::Router {
         github_redirect_url: None,
     };
 
-    // Use sqlx pool if DB is available, or mock
     let pool = sqlx::PgPool::connect_lazy(&config.database_url)
         .expect("Failed to build lazy connection pool");
 
     let app_state = Arc::new(AppState::new(pool, config, prometheus_handle));
-    create_app(app_state)
+    (create_app(app_state.clone()), app_state)
 }
 
 #[tokio::test]
 async fn test_health_check_endpoint() {
-    let app = setup_test_app().await;
+    let (app, _) = setup_test_app().await;
 
     let response = app
         .oneshot(
@@ -70,7 +69,6 @@ async fn test_health_check_endpoint() {
         .await
         .unwrap();
 
-    // /health returns 200 (healthy) or 503 (degraded if DB isn't running)
     let status = response.status();
     assert!(status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE);
 
@@ -82,7 +80,7 @@ async fn test_health_check_endpoint() {
 
 #[tokio::test]
 async fn test_prometheus_metrics_endpoint() {
-    let app = setup_test_app().await;
+    let (app, _) = setup_test_app().await;
 
     let response = app
         .oneshot(
@@ -101,7 +99,7 @@ async fn test_prometheus_metrics_endpoint() {
 
 #[tokio::test]
 async fn test_security_headers_injected() {
-    let app = setup_test_app().await;
+    let (app, _) = setup_test_app().await;
 
     let response = app
         .oneshot(
@@ -116,10 +114,7 @@ async fn test_security_headers_injected() {
         .unwrap();
 
     let headers = response.headers();
-    assert_eq!(
-        headers.get("x-content-type-options").unwrap(),
-        "nosniff"
-    );
+    assert_eq!(headers.get("x-content-type-options").unwrap(), "nosniff");
     assert_eq!(headers.get("x-frame-options").unwrap(), "DENY");
     assert!(headers.get("strict-transport-security").is_some());
     assert!(headers.get("x-request-id").is_some());
@@ -127,9 +122,8 @@ async fn test_security_headers_injected() {
 
 #[tokio::test]
 async fn test_validation_error_envelope() {
-    let app = setup_test_app().await;
+    let (app, _) = setup_test_app().await;
 
-    // Send invalid sign up payload (short password and invalid email)
     let invalid_payload = serde_json::json!({
         "name": "A",
         "email": "invalid-email",
@@ -161,7 +155,7 @@ async fn test_validation_error_envelope() {
 
 #[tokio::test]
 async fn test_file_path_traversal_protection() {
-    let app = setup_test_app().await;
+    let (app, _) = setup_test_app().await;
 
     let response = app
         .oneshot(
@@ -175,7 +169,119 @@ async fn test_file_path_traversal_protection() {
         .await
         .unwrap();
 
-    // Should reject path traversal
     assert!(response.status() == StatusCode::BAD_REQUEST || response.status() == StatusCode::NOT_FOUND);
 }
 
+#[tokio::test]
+async fn test_presigned_url_generation() {
+    let (app, state) = setup_test_app().await;
+
+    let mock_user = axum_template::models::user::User {
+        id: uuid::Uuid::now_v7(),
+        name: "Test User".to_string(),
+        email: "user@test.local".to_string(),
+        email_verified: true,
+        image: None,
+        role: "user".to_string(),
+        banned: false,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    let token = axum_template::services::auth::AuthService::generate_jwt(
+        &mock_user,
+        &state.config,
+    )
+    .unwrap();
+
+    let payload = serde_json::json!({
+        "filename": "avatar.png",
+        "content_type": "image/png",
+        "size_bytes": 1024
+    });
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/files/presigned-url")
+                .method("POST")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .header("x-forwarded-for", "127.0.0.1")
+                .body(Body::from(serde_json::to_vec(&payload).unwrap()))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["success"], true);
+    assert!(json["data"]["upload_url"].is_string());
+    assert!(json["data"]["file_url"].is_string());
+}
+
+#[tokio::test]
+async fn test_rbac_admin_guard_rejection_for_normal_user() {
+    let (app, state) = setup_test_app().await;
+
+    let normal_user = axum_template::models::user::User {
+        id: uuid::Uuid::now_v7(),
+        name: "Normal User".to_string(),
+        email: "normaluser@test.local".to_string(),
+        email_verified: true,
+        image: None,
+        role: "user".to_string(),
+        banned: false,
+        created_at: chrono::Utc::now(),
+        updated_at: chrono::Utc::now(),
+    };
+
+    let user_token = axum_template::services::auth::AuthService::generate_jwt(
+        &normal_user,
+        &state.config,
+    )
+    .unwrap();
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/audit-logs")
+                .method("GET")
+                .header(header::AUTHORIZATION, format!("Bearer {user_token}"))
+                .header("x-forwarded-for", "127.0.0.1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    // Normal user must be strictly 403 Forbidden on admin audit logs
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+    let body = response.into_body().collect().await.unwrap().to_bytes();
+    let json: Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(json["success"], false);
+    assert_eq!(json["error"]["code"], "FORBIDDEN");
+}
+
+#[tokio::test]
+async fn test_unauthorized_missing_jwt_rejection() {
+    let (app, _) = setup_test_app().await;
+
+    let response = app
+        .oneshot(
+            Request::builder()
+                .uri("/api/v1/users/me")
+                .method("GET")
+                .header("x-forwarded-for", "127.0.0.1")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+}
