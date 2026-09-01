@@ -1,7 +1,8 @@
-use crate::{config::AppConfig, middleware::rate_limit, state::AppState};
+﻿use crate::{config::AppConfig, middleware::rate_limit, state::AppState};
 use std::sync::Arc;
 use utoipa_axum::router::OpenApiRouter;
 
+pub mod apps;
 pub mod audit;
 pub mod auth;
 pub mod files;
@@ -17,6 +18,7 @@ pub fn router(config: &AppConfig) -> OpenApiRouter<Arc<AppState>> {
         rate_limit::auth_limiter(config).expect("Invalid auth rate limit configuration");
 
     OpenApiRouter::new()
+        .nest("/apps", apps::router())
         .nest("/auth", auth::router().layer(auth_limiter))
         .nest("/users", users::router())
         .nest("/files", files::router())

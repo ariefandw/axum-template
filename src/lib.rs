@@ -30,6 +30,9 @@ use crate::{
     config::AppConfig,
     error::{ApiErrorPayload, ApiErrorResponse, ApiResponse},
     models::events::{AuditLog, Notification, RealtimeEvent},
+    models::org::{
+        AddOrgMemberRequest, App, CreateAppRequest, CreateOrgRequest, OrgMember, Organization,
+    },
     models::pagination::{CursorMeta, CursorParams, PageMeta, PageParams},
     models::upload::{
         FileRecord, PresignedUploadRequest, PresignedUploadResponse, SignedUrlResponse,
@@ -51,15 +54,20 @@ use crate::{
         title = "Axum Production API",
         version = "1.0.0",
         description = "Production-ready Axum API scaffold: session-backed auth, RBAC, \
-                       owned storage with signed URLs, rate limiting, idempotency, metrics, \
+                       apps, organizations, owned storage with signed URLs, rate limiting, idempotency, metrics, \
                        cross-replica realtime, notifications, and an append-only audit log"
     ),
     components(schemas(
         HealthResponse, ApiErrorResponse, ApiErrorPayload,
+        ApiResponse<App>, ApiResponse<Vec<App>>,
+        ApiResponse<Organization>, ApiResponse<Vec<Organization>>,
+        ApiResponse<OrgMember>,
         ApiResponse<AuthResponse>, ApiResponse<UserResponse>, ApiResponse<Vec<UserResponse>>,
         ApiResponse<Vec<Notification>>, ApiResponse<Vec<AuditLog>>, ApiResponse<OAuthUrlResponse>,
         ApiResponse<UploadResponse>, ApiResponse<PresignedUploadResponse>,
         ApiResponse<SignedUrlResponse>, ApiResponse<String>,
+        CreateAppRequest, CreateOrgRequest, AddOrgMemberRequest,
+        App, Organization, OrgMember,
         SignUpEmailRequest, SignInEmailRequest, RefreshTokenRequest, VerifyEmailRequest,
         ForgetPasswordRequest, ResetPasswordRequest, UpdateUserRequest, ChangePasswordRequest,
         PresignedUploadRequest, PresignedUploadResponse, SignedUrlResponse, UploadResponse,
@@ -71,6 +79,8 @@ use crate::{
     tags(
         (name = "Observability", description = "Liveness, readiness and Prometheus metrics"),
         (name = "Authentication", description = "Registration, sign-in, sessions and recovery"),
+        (name = "Applications", description = "Multi-app platform registry"),
+        (name = "Organizations", description = "B2B tenant management and org memberships"),
         (name = "Users", description = "Profile management and admin user queries"),
         (name = "Notifications", description = "In-app notifications feed"),
         (name = "Realtime", description = "Server-Sent Events stream"),
