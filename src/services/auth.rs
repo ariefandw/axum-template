@@ -104,10 +104,6 @@ impl AuthService {
         }
     }
 
-    pub fn generate_random_token(len: usize) -> String {
-        crypto::random_token(len)
-    }
-
     // -- access tokens ------------------------------------------------------
 
     pub fn generate_access_token(

@@ -56,6 +56,9 @@ jobs:
       - name: Test
         run: cargo test --all-features
 
+      - name: Reject public functions with no callers
+        run: ./scripts/check-dead-public-items.sh
+
       - name: Verify openapi.json is current
         run: |
           cargo run --bin export_openapi

@@ -67,10 +67,6 @@ impl AuthUser {
         self.role == "admin"
     }
 
-    pub fn is_api_key(&self) -> bool {
-        matches!(self.credential, Credential::ApiKey { .. })
-    }
-
     /// The session this caller is on, if they are on one. `None` for API keys,
     /// which deliberately have no session: the previous implementation used
     /// `Uuid::nil()`, which silently matched no row and made session-scoped
@@ -84,20 +80,6 @@ impl AuthUser {
 
     pub fn require_scope(&self, scope: ApiScope) -> Result<(), AppError> {
         self.credential.require_scope(scope)
-    }
-
-    /// Refuse an operation to machine credentials outright.
-    ///
-    /// Account-lifecycle actions — changing the password, deleting the account,
-    /// revoking sessions, minting further keys — are the ones that let a leaked
-    /// key escalate into permanent control, so no scope unlocks them.
-    pub fn require_interactive_session(&self, action: &str) -> Result<(), AppError> {
-        match self.credential {
-            Credential::Session { .. } => Ok(()),
-            Credential::ApiKey { .. } => Err(AppError::Forbidden(format!(
-                "{action} requires an interactive session; API keys cannot perform it"
-            ))),
-        }
     }
 }
 

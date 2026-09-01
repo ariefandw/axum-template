@@ -70,19 +70,6 @@ impl NotificationService {
         Ok(notif)
     }
 
-    /// Notify without failing the operation that triggered it.
-    pub async fn notify_best_effort(
-        state: &Arc<AppState>,
-        user_id: Uuid,
-        title: &str,
-        body: &str,
-        data: Option<serde_json::Value>,
-    ) {
-        if let Err(e) = Self::create(state, user_id, title, body, data).await {
-            tracing::warn!(%user_id, title, error = %e, "Failed to create notification");
-        }
-    }
-
     pub async fn mark_as_read(
         state: &Arc<AppState>,
         user_id: Uuid,
