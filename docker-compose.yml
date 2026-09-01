@@ -1,4 +1,4 @@
-﻿services:
+services:
   postgres:
     image: postgres:17-alpine
     container_name: axum_template_postgres
@@ -22,11 +22,35 @@
     container_name: axum_template_mailpit
     restart: unless-stopped
     ports:
-      - "1025:1025" # SMTP port
+      - "1025:1025" # SMTP
       - "8025:8025" # Web UI
     environment:
       MP_MAX_MESSAGES: 500
       MP_DATA_FILE: ""
 
+  # The API itself, so `docker compose up` brings up a complete stack.
+  # Disabled by default; enable with: docker compose --profile app up
+  api:
+    profiles: ["app"]
+    build: .
+    container_name: axum_template_api
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "3000:3000"
+    environment:
+      APP_ENV: development
+      DATABASE_URL: postgres://postgres:postgrespassword@postgres:5432/axum_template_db
+      JWT_SECRET: local-development-jwt-secret-at-least-32-chars
+      SMTP_HOST: mailpit
+      SMTP_PORT: 1025
+      SMTP_TLS: "false"
+      PUBLIC_BASE_URL: http://localhost:3000
+    volumes:
+      - uploads:/app/uploads
+
 volumes:
   pgdata:
+  uploads:

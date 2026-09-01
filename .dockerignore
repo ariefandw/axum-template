@@ -1,0 +1,12 @@
+target/
+.git/
+.github/
+.env
+.env.*
+!.env.example
+*.log
+uploads/
+openapi.json
+README.md
+AGENTS.md
+LICENSE

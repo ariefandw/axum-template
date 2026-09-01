@@ -2,9 +2,10 @@
   "openapi": "3.1.0",
   "info": {
     "title": "Axum Production API",
-    "description": "Production-ready Axum API scaffold with Auth, Rate Limiting, Idempotency, Metrics, Realtime, Notifications, and Audit Logs",
+    "description": "Production-ready Axum API scaffold: session-backed auth, RBAC, owned storage with signed URLs, rate limiting, idempotency, metrics, cross-replica realtime, notifications, and an append-only audit log",
     "license": {
-      "name": ""
+      "name": "MIT",
+      "identifier": "MIT"
     },
     "version": "1.0.0"
   },
@@ -14,27 +15,13 @@
         "tags": [
           "Audit"
         ],
+        "summary": "Audit logs are keyset-paginated: the table is append-only and grows without\nbound, so `OFFSET` plus `COUNT(*)` would get slower with every entry.",
         "operationId": "list_audit_logs",
         "parameters": [
           {
-            "name": "page",
+            "name": "limit",
             "in": "query",
-            "description": "Page number (1-indexed, default: 1)",
-            "required": false,
-            "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "int64",
-              "default": 1,
-              "minimum": 1
-            }
-          },
-          {
-            "name": "page_size",
-            "in": "query",
-            "description": "Items per page (default: 20, max: 100)",
+            "description": "Limit number of items (default: 20, max: 100)",
             "required": false,
             "schema": {
               "type": [
@@ -46,11 +33,48 @@
               "maximum": 100,
               "minimum": 1
             }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor token for next page",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "user_id",
+            "in": "query",
+            "description": "Restrict to one actor.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "action",
+            "in": "query",
+            "description": "Restrict to one action, e.g. `user.signed_in`.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Paginated list of system audit logs (Admin only)",
+            "description": "Audit log page (admin only)",
             "content": {
               "application/json": {
                 "schema": {
@@ -59,18 +83,8 @@
               }
             }
           },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
-                }
-              }
-            }
-          },
           "403": {
-            "description": "Forbidden: Admin privileges required",
+            "description": "Admin privileges required",
             "content": {
               "application/json": {
                 "schema": {
@@ -97,7 +111,7 @@
           {
             "name": "code",
             "in": "query",
-            "description": "OAuth authorization code",
+            "description": "Authorization code",
             "required": true,
             "schema": {
               "type": "string"
@@ -106,8 +120,8 @@
           {
             "name": "state",
             "in": "query",
-            "description": "CSRF state token",
-            "required": false,
+            "description": "CSRF state issued by /sign-in/social/github",
+            "required": true,
             "schema": {
               "type": "string"
             }
@@ -115,7 +129,7 @@
         ],
         "responses": {
           "200": {
-            "description": "GitHub login successful",
+            "description": "Signed in with GitHub",
             "content": {
               "application/json": {
                 "schema": {
@@ -125,7 +139,7 @@
             }
           },
           "401": {
-            "description": "OAuth authentication failed",
+            "description": "Invalid state or failed exchange",
             "content": {
               "application/json": {
                 "schema": {
@@ -147,7 +161,7 @@
           {
             "name": "code",
             "in": "query",
-            "description": "OAuth authorization code",
+            "description": "Authorization code",
             "required": true,
             "schema": {
               "type": "string"
@@ -156,8 +170,8 @@
           {
             "name": "state",
             "in": "query",
-            "description": "CSRF state token",
-            "required": false,
+            "description": "CSRF state issued by /sign-in/social/google",
+            "required": true,
             "schema": {
               "type": "string"
             }
@@ -165,7 +179,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Google login successful",
+            "description": "Signed in with Google",
             "content": {
               "application/json": {
                 "schema": {
@@ -175,7 +189,7 @@
             }
           },
           "401": {
-            "description": "OAuth authentication failed",
+            "description": "Invalid state or failed exchange",
             "content": {
               "application/json": {
                 "schema": {
@@ -205,7 +219,7 @@
         },
         "responses": {
           "200": {
-            "description": "Password changed (Better Auth alias for PATCH /users/me/password)",
+            "description": "Password changed",
             "content": {
               "application/json": {
                 "schema": {
@@ -213,28 +227,13 @@
                 }
               }
             }
-          },
-          "400": {
-            "description": "Invalid password data",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Incorrect current password",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
-                }
-              }
-            }
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
       }
     },
     "/api/v1/auth/delete-user": {
@@ -245,7 +244,7 @@
         "operationId": "delete_user",
         "responses": {
           "200": {
-            "description": "Account deleted (Better Auth alias for DELETE /users/me)",
+            "description": "Account deleted",
             "content": {
               "application/json": {
                 "schema": {
@@ -253,18 +252,13 @@
                 }
               }
             }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
-                }
-              }
-            }
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
       }
     },
     "/api/v1/auth/forget-password": {
@@ -285,21 +279,11 @@
         },
         "responses": {
           "200": {
-            "description": "Password reset initiated",
+            "description": "Reset initiated if the address is registered",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiResponse_String"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Validation error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
                 }
               }
             }
@@ -315,7 +299,7 @@
         "operationId": "get_session",
         "responses": {
           "200": {
-            "description": "Current authenticated user profile",
+            "description": "Current authenticated user",
             "content": {
               "application/json": {
                 "schema": {
@@ -342,6 +326,46 @@
         ]
       }
     },
+    "/api/v1/auth/refresh": {
+      "post": {
+        "tags": [
+          "Authentication"
+        ],
+        "operationId": "refresh",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RefreshTokenRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "New access and refresh token pair",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse_AuthResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "description": "Invalid, expired, or replayed refresh token",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/auth/reset-password": {
       "post": {
         "tags": [
@@ -360,7 +384,7 @@
         },
         "responses": {
           "200": {
-            "description": "Password reset completed",
+            "description": "Password reset; all sessions revoked",
             "content": {
               "application/json": {
                 "schema": {
@@ -400,7 +424,7 @@
         },
         "responses": {
           "200": {
-            "description": "Login successful",
+            "description": "Signed in",
             "content": {
               "application/json": {
                 "schema": {
@@ -411,6 +435,16 @@
           },
           "401": {
             "description": "Invalid credentials",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "429": {
+            "description": "Account temporarily locked",
             "content": {
               "application/json": {
                 "schema": {
@@ -430,21 +464,11 @@
         "operationId": "github_auth",
         "responses": {
           "200": {
-            "description": "GitHub OAuth authorization URL",
+            "description": "GitHub authorization URL",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiResponse_OAuthUrlResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "GitHub OAuth not configured",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
                 }
               }
             }
@@ -460,7 +484,7 @@
         "operationId": "google_auth",
         "responses": {
           "200": {
-            "description": "Google OAuth authorization URL",
+            "description": "Google authorization URL",
             "content": {
               "application/json": {
                 "schema": {
@@ -468,18 +492,58 @@
                 }
               }
             }
-          },
-          "400": {
-            "description": "Google OAuth not configured",
+          }
+        }
+      }
+    },
+    "/api/v1/auth/sign-out": {
+      "post": {
+        "tags": [
+          "Authentication"
+        ],
+        "operationId": "sign_out",
+        "responses": {
+          "200": {
+            "description": "Current session revoked",
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
+                  "$ref": "#/components/schemas/ApiResponse_String"
                 }
               }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/auth/sign-out-all": {
+      "post": {
+        "tags": [
+          "Authentication"
+        ],
+        "operationId": "sign_out_all",
+        "responses": {
+          "200": {
+            "description": "All sessions revoked",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse_String"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
       }
     },
     "/api/v1/auth/sign-up/email": {
@@ -500,7 +564,7 @@
         },
         "responses": {
           "201": {
-            "description": "User registered successfully",
+            "description": "User registered",
             "content": {
               "application/json": {
                 "schema": {
@@ -509,8 +573,8 @@
               }
             }
           },
-          "400": {
-            "description": "Bad request / validation error",
+          "409": {
+            "description": "User already exists",
             "content": {
               "application/json": {
                 "schema": {
@@ -519,8 +583,8 @@
               }
             }
           },
-          "409": {
-            "description": "User already exists",
+          "422": {
+            "description": "Validation error",
             "content": {
               "application/json": {
                 "schema": {
@@ -550,7 +614,7 @@
         },
         "responses": {
           "200": {
-            "description": "User profile updated (Better Auth alias for PATCH /users/me)",
+            "description": "Profile updated",
             "content": {
               "application/json": {
                 "schema": {
@@ -558,28 +622,13 @@
                 }
               }
             }
-          },
-          "400": {
-            "description": "Validation error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
-                }
-              }
-            }
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
       }
     },
     "/api/v1/auth/verify-email": {
@@ -640,7 +689,7 @@
         },
         "responses": {
           "200": {
-            "description": "Presigned direct upload URL generated",
+            "description": "Signed, expiring upload grant",
             "content": {
               "application/json": {
                 "schema": {
@@ -650,17 +699,7 @@
             }
           },
           "400": {
-            "description": "Validation error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
+            "description": "Unacceptable content type",
             "content": {
               "application/json": {
                 "schema": {
@@ -685,7 +724,7 @@
         "operationId": "upload_file",
         "responses": {
           "201": {
-            "description": "File uploaded successfully",
+            "description": "File uploaded",
             "content": {
               "application/json": {
                 "schema": {
@@ -695,7 +734,7 @@
             }
           },
           "400": {
-            "description": "Invalid file or exceeds limit",
+            "description": "Missing or unacceptable file",
             "content": {
               "application/json": {
                 "schema": {
@@ -704,8 +743,8 @@
               }
             }
           },
-          "401": {
-            "description": "Unauthorized",
+          "413": {
+            "description": "File exceeds the size limit",
             "content": {
               "application/json": {
                 "schema": {
@@ -722,26 +761,64 @@
         ]
       }
     },
-    "/api/v1/files/{filename}": {
+    "/api/v1/files/{id}": {
       "get": {
         "tags": [
           "Storage"
         ],
+        "summary": "Download a file.",
+        "description": "Access requires one of: the file being public, a bearer token for its owner\nor an administrator, or a valid unexpired signature. Callers who fail all\nthree get 404 rather than 403, so this cannot be used to probe for file IDs.",
         "operationId": "get_file",
         "parameters": [
           {
-            "name": "filename",
+            "name": "id",
             "in": "path",
-            "description": "Stored filename (e.g. uuid.png)",
+            "description": "File ID",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "format": "uuid"
+            }
+          },
+          {
+            "name": "expires",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "integer",
+                "null"
+              ],
+              "format": "int64"
+            }
+          },
+          {
+            "name": "signature",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
+          },
+          {
+            "name": "key",
+            "in": "query",
+            "description": "Reserved key, present on presigned upload URLs.",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
             }
           }
         ],
         "responses": {
           "200": {
-            "description": "File contents stream",
+            "description": "File contents",
             "content": {
               "application/octet-stream": {}
             }
@@ -765,18 +842,19 @@
         "operationId": "delete_file",
         "parameters": [
           {
-            "name": "filename",
+            "name": "id",
             "in": "path",
-            "description": "Stored filename (e.g. uuid.png)",
+            "description": "File ID",
             "required": true,
             "schema": {
-              "type": "string"
+              "type": "string",
+              "format": "uuid"
             }
           }
         ],
         "responses": {
           "200": {
-            "description": "File deleted successfully",
+            "description": "File deleted",
             "content": {
               "application/json": {
                 "schema": {
@@ -785,12 +863,49 @@
               }
             }
           },
-          "401": {
-            "description": "Unauthorized",
+          "404": {
+            "description": "File not found or not yours",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/files/{id}/signed-url": {
+      "get": {
+        "tags": [
+          "Storage"
+        ],
+        "operationId": "create_signed_download_url",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "File ID",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Signed, expiring download URL",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiResponse_SignedUrlResponse"
                 }
               }
             }
@@ -818,27 +933,13 @@
         "tags": [
           "Notifications"
         ],
+        "summary": "Keyset-paginated, and scoped to the calling user by the query itself.",
         "operationId": "list_notifications",
         "parameters": [
           {
-            "name": "page",
+            "name": "limit",
             "in": "query",
-            "description": "Page number (1-indexed, default: 1)",
-            "required": false,
-            "schema": {
-              "type": [
-                "integer",
-                "null"
-              ],
-              "format": "int64",
-              "default": 1,
-              "minimum": 1
-            }
-          },
-          {
-            "name": "page_size",
-            "in": "query",
-            "description": "Items per page (default: 20, max: 100)",
+            "description": "Limit number of items (default: 20, max: 100)",
             "required": false,
             "schema": {
               "type": [
@@ -850,11 +951,23 @@
               "maximum": 100,
               "minimum": 1
             }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "description": "Opaque cursor token for next page",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ]
+            }
           }
         ],
         "responses": {
           "200": {
-            "description": "Paginated list of notifications for current user",
+            "description": "Notification page for the current user",
             "content": {
               "application/json": {
                 "schema": {
@@ -889,21 +1002,11 @@
         "operationId": "mark_all_notifications_read",
         "responses": {
           "200": {
-            "description": "All notifications marked as read",
+            "description": "All marked as read",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiResponse_String"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
                 }
               }
             }
@@ -936,7 +1039,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Notification marked as read",
+            "description": "Marked as read",
             "content": {
               "application/json": {
                 "schema": {
@@ -945,18 +1048,8 @@
               }
             }
           },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
-                }
-              }
-            }
-          },
           "404": {
-            "description": "Notification not found",
+            "description": "Not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -978,10 +1071,12 @@
         "tags": [
           "Realtime"
         ],
+        "summary": "Server-sent event stream, scoped to the calling user.",
+        "description": "Events reach this replica through the Postgres listener, so a client here\nreceives events published by any replica. Dropped events are surfaced as an\nexplicit `lagged` event rather than silently discarded, which lets a client\nknow it must re-fetch instead of assuming it is up to date.",
         "operationId": "sse_stream",
         "responses": {
           "200": {
-            "description": "Realtime SSE event stream for authenticated user",
+            "description": "SSE stream for the current user",
             "content": {
               "text/event-stream": {}
             }
@@ -1035,7 +1130,7 @@
         ],
         "responses": {
           "200": {
-            "description": "Paginated list of users (Admin only)",
+            "description": "Paginated users (admin only)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1044,18 +1139,8 @@
               }
             }
           },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
-                }
-              }
-            }
-          },
           "403": {
-            "description": "Forbidden: Admin privileges required",
+            "description": "Admin privileges required",
             "content": {
               "application/json": {
                 "schema": {
@@ -1080,7 +1165,7 @@
         "operationId": "get_me",
         "responses": {
           "200": {
-            "description": "Current authenticated user profile",
+            "description": "Current authenticated user",
             "content": {
               "application/json": {
                 "schema": {
@@ -1113,21 +1198,11 @@
         "operationId": "delete_me",
         "responses": {
           "200": {
-            "description": "Account deleted successfully",
+            "description": "Account deleted",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiResponse_String"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
                 }
               }
             }
@@ -1156,7 +1231,7 @@
         },
         "responses": {
           "200": {
-            "description": "User profile updated",
+            "description": "Profile updated",
             "content": {
               "application/json": {
                 "schema": {
@@ -1165,18 +1240,8 @@
               }
             }
           },
-          "400": {
+          "422": {
             "description": "Validation error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "description": "Unauthorized",
             "content": {
               "application/json": {
                 "schema": {
@@ -1211,21 +1276,11 @@
         },
         "responses": {
           "200": {
-            "description": "Password changed successfully",
+            "description": "Password changed; other sessions revoked",
             "content": {
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiResponse_String"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid password data",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorResponse"
                 }
               }
             }
@@ -1253,10 +1308,11 @@
         "tags": [
           "Observability"
         ],
+        "summary": "Retained as an alias for readiness, so existing probes keep working.",
         "operationId": "health_check",
         "responses": {
           "200": {
-            "description": "System health check",
+            "description": "System health",
             "content": {
               "application/json": {
                 "schema": {
@@ -1278,20 +1334,83 @@
         }
       }
     },
+    "/health/live": {
+      "get": {
+        "tags": [
+          "Observability"
+        ],
+        "summary": "Liveness: is the process running? Deliberately does not touch the database.",
+        "description": "A single endpoint that checks dependencies makes an orchestrator restart pods\nduring a database blip, which removes capacity exactly when the database is\nalready struggling. Liveness and readiness must answer different questions.",
+        "operationId": "liveness",
+        "responses": {
+          "200": {
+            "description": "Process is alive",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health/ready": {
+      "get": {
+        "tags": [
+          "Observability"
+        ],
+        "summary": "Readiness: can this instance serve traffic? Fails the instance out of the\nload balancer without restarting it.",
+        "operationId": "readiness",
+        "responses": {
+          "200": {
+            "description": "Ready to serve",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Dependencies unavailable",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/metrics": {
       "get": {
         "tags": [
           "Observability"
         ],
+        "summary": "Prometheus scrape endpoint.",
+        "description": "Requires `METRICS_TOKEN` when one is configured, which production always is.\nRoute inventory, traffic volume and error rates are internal information and\nwere previously served to anyone.",
         "operationId": "prometheus_metrics",
         "responses": {
           "200": {
-            "description": "Prometheus metrics dump",
+            "description": "Prometheus exposition format",
             "content": {
               "text/plain": {}
             }
+          },
+          "401": {
+            "description": "Missing or invalid metrics token"
           }
-        }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
       }
     }
   },
@@ -1341,8 +1460,10 @@
             "type": "object",
             "required": [
               "access_token",
+              "refresh_token",
               "token_type",
               "expires_in",
+              "session_id",
               "user"
             ],
             "properties": {
@@ -1351,7 +1472,16 @@
               },
               "expires_in": {
                 "type": "integer",
-                "format": "int64"
+                "format": "int64",
+                "description": "Access token lifetime in seconds."
+              },
+              "refresh_token": {
+                "type": "string",
+                "description": "Opaque, rotated on every refresh, and revocable server-side."
+              },
+              "session_id": {
+                "type": "string",
+                "format": "uuid"
               },
               "token_type": {
                 "type": "string"
@@ -1379,11 +1509,12 @@
             "type": "object",
             "required": [
               "url",
-              "csrf_token"
+              "state"
             ],
             "properties": {
-              "csrf_token": {
-                "type": "string"
+              "state": {
+                "type": "string",
+                "description": "Echo of the CSRF state, for clients that want to correlate the redirect."
               },
               "url": {
                 "type": "string"
@@ -1406,25 +1537,72 @@
         "properties": {
           "data": {
             "type": "object",
+            "description": "A genuinely signed upload grant. The previous implementation returned a static\npath with no signature and an advertised expiry that nothing enforced.",
             "required": [
-              "key",
+              "storage_key",
               "upload_url",
               "file_url",
-              "expires_in_seconds"
+              "expires_at",
+              "expires_in_seconds",
+              "max_bytes"
             ],
             "properties": {
+              "expires_at": {
+                "type": "string",
+                "format": "date-time"
+              },
               "expires_in_seconds": {
                 "type": "integer",
-                "format": "int64",
-                "minimum": 0
+                "format": "int64"
               },
               "file_url": {
                 "type": "string"
               },
-              "key": {
+              "max_bytes": {
+                "type": "integer",
+                "format": "int64",
+                "minimum": 0
+              },
+              "storage_key": {
                 "type": "string"
               },
               "upload_url": {
+                "type": "string",
+                "description": "Absolute URL carrying the signature and expiry as query parameters."
+              }
+            }
+          },
+          "meta": {},
+          "success": {
+            "type": "boolean"
+          }
+        }
+      },
+      "ApiResponse_SignedUrlResponse": {
+        "type": "object",
+        "description": "Standardized Success Envelope",
+        "required": [
+          "success",
+          "data"
+        ],
+        "properties": {
+          "data": {
+            "type": "object",
+            "required": [
+              "url",
+              "expires_at",
+              "expires_in_seconds"
+            ],
+            "properties": {
+              "expires_at": {
+                "type": "string",
+                "format": "date-time"
+              },
+              "expires_in_seconds": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "url": {
                 "type": "string"
               }
             }
@@ -1464,18 +1642,17 @@
             "type": "object",
             "required": [
               "id",
-              "filename",
+              "storage_key",
               "original_name",
               "size_bytes",
               "mime_type",
+              "visibility",
               "url"
             ],
             "properties": {
-              "filename": {
-                "type": "string"
-              },
               "id": {
-                "type": "string"
+                "type": "string",
+                "format": "uuid"
               },
               "mime_type": {
                 "type": "string"
@@ -1485,10 +1662,16 @@
               },
               "size_bytes": {
                 "type": "integer",
-                "format": "int64",
-                "minimum": 0
+                "format": "int64"
+              },
+              "storage_key": {
+                "type": "string"
               },
               "url": {
+                "type": "string",
+                "description": "Relative download path. For a private file this needs a bearer token or a\nsigned URL obtained from `/files/{id}/signed-url`."
+              },
+              "visibility": {
                 "type": "string"
               }
             }
@@ -1783,8 +1966,10 @@
         "type": "object",
         "required": [
           "access_token",
+          "refresh_token",
           "token_type",
           "expires_in",
+          "session_id",
           "user"
         ],
         "properties": {
@@ -1793,7 +1978,16 @@
           },
           "expires_in": {
             "type": "integer",
-            "format": "int64"
+            "format": "int64",
+            "description": "Access token lifetime in seconds."
+          },
+          "refresh_token": {
+            "type": "string",
+            "description": "Opaque, rotated on every refresh, and revocable server-side."
+          },
+          "session_id": {
+            "type": "string",
+            "format": "uuid"
           },
           "token_type": {
             "type": "string"
@@ -1870,6 +2064,62 @@
           }
         }
       },
+      "FileRecord": {
+        "type": "object",
+        "description": "A stored object. Uploads were previously untracked on disk, which left the\nfilename as the only access-control mechanism; ownership and visibility now\nlive in this row and every read and delete is authorized against it.",
+        "required": [
+          "id",
+          "bucket",
+          "storage_key",
+          "original_name",
+          "mime_type",
+          "size_bytes",
+          "visibility",
+          "created_at"
+        ],
+        "properties": {
+          "bucket": {
+            "type": "string"
+          },
+          "checksum_sha256": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "id": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "mime_type": {
+            "type": "string"
+          },
+          "original_name": {
+            "type": "string"
+          },
+          "owner_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
+          "size_bytes": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "storage_key": {
+            "type": "string"
+          },
+          "visibility": {
+            "type": "string"
+          }
+        }
+      },
       "ForgetPasswordRequest": {
         "type": "object",
         "required": [
@@ -1886,6 +2136,7 @@
         "required": [
           "status",
           "database",
+          "version",
           "timestamp"
         ],
         "properties": {
@@ -1898,6 +2149,9 @@
           "timestamp": {
             "type": "string",
             "format": "date-time"
+          },
+          "version": {
+            "type": "string"
           }
         }
       },
@@ -1938,18 +2192,17 @@
       },
       "OAuthCallbackQuery": {
         "type": "object",
+        "description": "The `state` parameter is required: it is checked against the pending\nauthorization request this server issued.",
         "required": [
-          "code"
+          "code",
+          "state"
         ],
         "properties": {
           "code": {
             "type": "string"
           },
           "state": {
-            "type": [
-              "string",
-              "null"
-            ]
+            "type": "string"
           }
         }
       },
@@ -1957,11 +2210,12 @@
         "type": "object",
         "required": [
           "url",
-          "csrf_token"
+          "state"
         ],
         "properties": {
-          "csrf_token": {
-            "type": "string"
+          "state": {
+            "type": "string",
+            "description": "Echo of the CSRF state, for clients that want to correlate the redirect."
           },
           "url": {
             "type": "string"
@@ -2052,31 +2306,50 @@
             ],
             "format": "int64",
             "minimum": 0
+          },
+          "visibility": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "`private` (default) or `public`."
           }
         }
       },
       "PresignedUploadResponse": {
         "type": "object",
+        "description": "A genuinely signed upload grant. The previous implementation returned a static\npath with no signature and an advertised expiry that nothing enforced.",
         "required": [
-          "key",
+          "storage_key",
           "upload_url",
           "file_url",
-          "expires_in_seconds"
+          "expires_at",
+          "expires_in_seconds",
+          "max_bytes"
         ],
         "properties": {
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
           "expires_in_seconds": {
             "type": "integer",
-            "format": "int64",
-            "minimum": 0
+            "format": "int64"
           },
           "file_url": {
             "type": "string"
           },
-          "key": {
+          "max_bytes": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "storage_key": {
             "type": "string"
           },
           "upload_url": {
-            "type": "string"
+            "type": "string",
+            "description": "Absolute URL carrying the signature and expiry as query parameters."
           }
         }
       },
@@ -2107,6 +2380,18 @@
           "timestamp": {
             "type": "string",
             "format": "date-time"
+          }
+        }
+      },
+      "RefreshTokenRequest": {
+        "type": "object",
+        "description": "Exchanges a refresh token for a new access token. The refresh token itself is\nrotated on every use, so a stolen-and-replayed token is detectable.",
+        "required": [
+          "refresh_token"
+        ],
+        "properties": {
+          "refresh_token": {
+            "type": "string"
           }
         }
       },
@@ -2165,6 +2450,27 @@
           }
         }
       },
+      "SignedUrlResponse": {
+        "type": "object",
+        "required": [
+          "url",
+          "expires_at",
+          "expires_in_seconds"
+        ],
+        "properties": {
+          "expires_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "expires_in_seconds": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "url": {
+            "type": "string"
+          }
+        }
+      },
       "UpdateUserRequest": {
         "type": "object",
         "properties": {
@@ -2186,18 +2492,17 @@
         "type": "object",
         "required": [
           "id",
-          "filename",
+          "storage_key",
           "original_name",
           "size_bytes",
           "mime_type",
+          "visibility",
           "url"
         ],
         "properties": {
-          "filename": {
-            "type": "string"
-          },
           "id": {
-            "type": "string"
+            "type": "string",
+            "format": "uuid"
           },
           "mime_type": {
             "type": "string"
@@ -2207,10 +2512,16 @@
           },
           "size_bytes": {
             "type": "integer",
-            "format": "int64",
-            "minimum": 0
+            "format": "int64"
+          },
+          "storage_key": {
+            "type": "string"
           },
           "url": {
+            "type": "string",
+            "description": "Relative download path. For a private file this needs a bearer token or a\nsigned URL obtained from `/files/{id}/signed-url`."
+          },
+          "visibility": {
             "type": "string"
           }
         }
@@ -2277,15 +2588,15 @@
   "tags": [
     {
       "name": "Observability",
-      "description": "Health and Prometheus metrics"
+      "description": "Liveness, readiness and Prometheus metrics"
     },
     {
       "name": "Authentication",
-      "description": "User registration, login, verification, and sessions"
+      "description": "Registration, sign-in, sessions and recovery"
     },
     {
       "name": "Users",
-      "description": "User profile management and user queries"
+      "description": "Profile management and admin user queries"
     },
     {
       "name": "Notifications",
@@ -2293,19 +2604,19 @@
     },
     {
       "name": "Realtime",
-      "description": "Server-Sent Events (SSE) stream"
+      "description": "Server-Sent Events stream"
     },
     {
       "name": "Audit",
-      "description": "Immutable compliance audit logs"
+      "description": "Append-only compliance audit log"
     },
     {
       "name": "Social Login",
-      "description": "OAuth2 endpoints (Google, GitHub)"
+      "description": "OAuth2 with PKCE (Google, GitHub)"
     },
     {
       "name": "Storage",
-      "description": "Streaming multipart file uploads & static downloads"
+      "description": "Owned file storage with signed URLs"
     }
   ]
 }

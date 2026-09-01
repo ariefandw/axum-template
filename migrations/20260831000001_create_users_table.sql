@@ -1,4 +1,4 @@
-﻿-- 1. Core Users Table
+-- 1. Core Users Table
 CREATE TABLE IF NOT EXISTS users (
     id UUID PRIMARY KEY,
     name VARCHAR(255) NOT NULL,

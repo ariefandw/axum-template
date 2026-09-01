@@ -1,127 +1,517 @@
-use std::path::Path;
+//! Object storage.
+//!
+//! Rebuilt around three properties the previous implementation lacked:
+//!
+//! * **Ownership.** Every upload gets a `files` row. Reads and deletes are
+//!   authorized against it instead of trusting whoever knows the filename.
+//! * **Real signatures.** Presigned URLs are HMAC-signed over the method, key and
+//!   expiry, and the signature is verified on use. The previous "presigned" URL
+//!   was an unsigned static path with a cosmetic expiry field.
+//! * **Content-based typing.** The stored MIME type comes from sniffing the
+//!   leading bytes and is cross-checked against the extension, rather than being
+//!   inferred from an attacker-supplied filename.
+
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+
 use axum::extract::multipart::Field;
+use chrono::{DateTime, Duration, Utc};
+use sha2::{Digest, Sha256};
 use tokio::fs;
 use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 use crate::{
+    crypto,
     error::AppError,
-    models::upload::{PresignedUploadRequest, PresignedUploadResponse, UploadResponse},
+    models::upload::{
+        FILE_COLUMNS, FileRecord, PresignedUploadRequest, PresignedUploadResponse,
+        SignedUrlResponse,
+    },
     state::AppState,
 };
+
+/// Operations a storage backend must provide. The local filesystem backend below
+/// is the default; an S3/R2 backend implements this same seam without touching
+/// the route or authorization layers.
+pub trait StorageBackend: Send + Sync {
+    fn root(&self) -> &Path;
+}
+
+pub struct LocalBackend {
+    root: PathBuf,
+}
+
+impl LocalBackend {
+    pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self { root: root.into() }
+    }
+}
+
+impl StorageBackend for LocalBackend {
+    fn root(&self) -> &Path {
+        &self.root
+    }
+}
 
 pub struct StorageService;
 
 impl StorageService {
+    // -- key handling -------------------------------------------------------
+
+    /// Storage keys are generated, never caller-supplied. Validating the shape
+    /// here means path traversal is impossible by construction rather than by
+    /// blocklist.
+    fn validate_storage_key(key: &str) -> Result<(), AppError> {
+        let valid = !key.is_empty()
+            && key.len() <= 128
+            && key
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.' || c == '_')
+            && !key.contains("..")
+            && !key.starts_with('.');
+
+        if valid {
+            Ok(())
+        } else {
+            Err(AppError::BadRequest("Invalid storage key".to_string()))
+        }
+    }
+
+    fn path_for(state: &Arc<AppState>, storage_key: &str) -> Result<PathBuf, AppError> {
+        Self::validate_storage_key(storage_key)?;
+        Ok(Path::new(&state.config.upload_dir).join(storage_key))
+    }
+
+    // -- content typing -----------------------------------------------------
+
+    /// Identify a file from its leading bytes. Extensions are caller-controlled,
+    /// so they are used only as a tie-breaker for formats without magic numbers.
+    pub fn sniff_mime(bytes: &[u8], filename: &str) -> &'static str {
+        const SNIFFERS: &[(&[u8], &str)] = &[
+            (b"\xFF\xD8\xFF", "image/jpeg"),
+            (b"\x89PNG\r\n\x1a\n", "image/png"),
+            (b"GIF87a", "image/gif"),
+            (b"GIF89a", "image/gif"),
+            (b"%PDF-", "application/pdf"),
+        ];
+
+        for (magic, mime) in SNIFFERS {
+            if bytes.starts_with(magic) {
+                return mime;
+            }
+        }
+
+        // RIFF....WEBP
+        if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
+            return "image/webp";
+        }
+
+        // Formats with no magic number: fall back to the extension, but only
+        // after confirming the content really is text.
+        let is_text = bytes.is_empty()
+            || std::str::from_utf8(&bytes[..bytes.len().min(512)]).is_ok_and(|s| {
+                !s.chars()
+                    .any(|c| c.is_control() && c != '\n' && c != '\r' && c != '\t')
+            });
+
+        if is_text {
+            let ext = Path::new(filename)
+                .extension()
+                .and_then(|e| e.to_str())
+                .unwrap_or("")
+                .to_ascii_lowercase();
+            return match ext.as_str() {
+                "json" => "application/json",
+                "txt" | "md" | "csv" | "log" => "text/plain",
+                _ => "application/octet-stream",
+            };
+        }
+
+        "application/octet-stream"
+    }
+
+    fn ensure_mime_allowed(state: &Arc<AppState>, mime: &str) -> Result<(), AppError> {
+        if state.config.allowed_upload_mime.iter().any(|m| m == mime) {
+            Ok(())
+        } else {
+            Err(AppError::BadRequest(format!(
+                "Files of type '{mime}' are not accepted"
+            )))
+        }
+    }
+
+    fn extension_for(mime: &str) -> &'static str {
+        match mime {
+            "image/jpeg" => "jpg",
+            "image/png" => "png",
+            "image/gif" => "gif",
+            "image/webp" => "webp",
+            "application/pdf" => "pdf",
+            "application/json" => "json",
+            "text/plain" => "txt",
+            _ => "bin",
+        }
+    }
+
+    // -- upload -------------------------------------------------------------
+
+    /// Stream a multipart field to disk, enforcing the size cap as it goes, then
+    /// record ownership. The file is removed if anything fails, so a rejected
+    /// upload never leaves a partial object behind.
     pub async fn save_upload_field(
         state: &Arc<AppState>,
+        owner_id: Uuid,
         mut field: Field<'_>,
-    ) -> Result<UploadResponse, AppError> {
-        let original_name = field
-            .file_name()
-            .unwrap_or("unnamed_file")
-            .to_string();
-
-        let ext = Path::new(&original_name)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("bin")
-            .to_lowercase();
-
+        visibility: &str,
+    ) -> Result<FileRecord, AppError> {
+        let original_name = sanitize_filename(field.file_name().unwrap_or("unnamed_file"));
         let file_id = Uuid::now_v7();
-        let stored_filename = format!("{file_id}.{ext}");
+        let max_bytes = state.config.max_upload_bytes;
 
         fs::create_dir_all(&state.config.upload_dir)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create upload dir: {e}").into()))?;
 
-        let dest_path = format!("{}/{}", state.config.upload_dir, stored_filename);
-        let mut file = fs::File::create(&dest_path)
+        // Written to a temporary name first: the final key encodes the sniffed
+        // type, which is not known until the first bytes arrive.
+        let temp_key = format!("{file_id}.part");
+        let temp_path = Path::new(&state.config.upload_dir).join(&temp_key);
+        let mut file = fs::File::create(&temp_path)
             .await
             .map_err(|e| AppError::Internal(format!("Failed to create file: {e}").into()))?;
 
-        let mut total_bytes: u64 = 0;
-        const MAX_BYTES: u64 = 10 * 1024 * 1024; // 10MB Limit
+        let mut total: u64 = 0;
+        let mut head = Vec::with_capacity(16);
+        let mut hasher = Sha256::new();
 
-        while let Some(chunk) = field
-            .chunk()
-            .await
-            .map_err(|e| AppError::BadRequest(format!("Failed to read chunk: {e}")))?
-        {
-            total_bytes += chunk.len() as u64;
-            if total_bytes > MAX_BYTES {
-                drop(file);
-                let _ = fs::remove_file(&dest_path).await;
-                return Err(AppError::BadRequest("File exceeds 10MB limit".to_string()));
-            }
-
-            file.write_all(&chunk)
+        let outcome: Result<(), AppError> = async {
+            while let Some(chunk) = field
+                .chunk()
                 .await
-                .map_err(|e| AppError::Internal(format!("Failed to write chunk: {e}").into()))?;
+                .map_err(|e| AppError::BadRequest(format!("Failed to read upload: {e}")))?
+            {
+                total += chunk.len() as u64;
+                if total > max_bytes {
+                    return Err(AppError::PayloadTooLarge(format!(
+                        "File exceeds the {max_bytes} byte limit"
+                    )));
+                }
+                if head.len() < 16 {
+                    head.extend_from_slice(&chunk[..chunk.len().min(16 - head.len())]);
+                }
+                hasher.update(&chunk);
+                file.write_all(&chunk).await.map_err(|e| {
+                    AppError::Internal(format!("Failed to write chunk: {e}").into())
+                })?;
+            }
+            file.flush()
+                .await
+                .map_err(|e| AppError::Internal(format!("Failed to flush upload: {e}").into()))?;
+            Ok(())
+        }
+        .await;
+
+        drop(file);
+
+        if let Err(e) = outcome {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e);
         }
 
-        let mime_type = match ext.as_str() {
-            "jpg" | "jpeg" => "image/jpeg",
-            "png" => "image/png",
-            "webp" => "image/webp",
-            "gif" => "image/gif",
-            "pdf" => "application/pdf",
-            "txt" => "text/plain",
-            "json" => "application/json",
-            _ => "application/octet-stream",
-        };
+        if total == 0 {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(AppError::BadRequest("Uploaded file is empty".to_string()));
+        }
 
-        Ok(UploadResponse {
-            id: file_id.to_string(),
-            filename: stored_filename.clone(),
-            original_name,
-            size_bytes: total_bytes,
-            mime_type: mime_type.to_string(),
-            url: format!("/api/v1/files/{stored_filename}"),
-        })
+        let mime = Self::sniff_mime(&head, &original_name);
+        if let Err(e) = Self::ensure_mime_allowed(state, mime) {
+            let _ = fs::remove_file(&temp_path).await;
+            return Err(e);
+        }
+
+        let storage_key = format!("{file_id}.{}", Self::extension_for(mime));
+        let final_path = Path::new(&state.config.upload_dir).join(&storage_key);
+        fs::rename(&temp_path, &final_path)
+            .await
+            .map_err(|e| AppError::Internal(format!("Failed to finalize upload: {e}").into()))?;
+
+        let checksum = format!("{:x}", hasher.finalize());
+        let visibility = normalize_visibility(visibility)?;
+
+        let record = sqlx::query_as::<_, FileRecord>(&format!(
+            r#"
+            INSERT INTO files
+                (id, owner_id, bucket, storage_key, original_name, mime_type, size_bytes,
+                 checksum_sha256, visibility)
+            VALUES ($1, $2, 'default', $3, $4, $5, $6, $7, $8)
+            RETURNING {FILE_COLUMNS}
+            "#
+        ))
+        .bind(file_id)
+        .bind(owner_id)
+        .bind(&storage_key)
+        .bind(&original_name)
+        .bind(mime)
+        .bind(total as i64)
+        .bind(&checksum)
+        .bind(visibility)
+        .fetch_one(&state.db)
+        .await;
+
+        match record {
+            Ok(record) => Ok(record),
+            Err(e) => {
+                // Never leave an orphaned object behind if the row fails.
+                let _ = fs::remove_file(&final_path).await;
+                Err(e.into())
+            }
+        }
+    }
+
+    // -- authorized access --------------------------------------------------
+
+    pub async fn load_record(state: &Arc<AppState>, file_id: Uuid) -> Result<FileRecord, AppError> {
+        sqlx::query_as::<_, FileRecord>(&format!(
+            "SELECT {FILE_COLUMNS} FROM files WHERE id = $1 AND deleted_at IS NULL"
+        ))
+        .bind(file_id)
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("File not found".to_string()))
+    }
+
+    /// Public files are readable by anyone; private files only by their owner or
+    /// an administrator. A caller who may not read a file is told it does not
+    /// exist, so the endpoint cannot be used to probe for file IDs.
+    pub fn authorize_read(
+        record: &FileRecord,
+        viewer: Option<(Uuid, &str)>,
+    ) -> Result<(), AppError> {
+        if record.visibility == "public" {
+            return Ok(());
+        }
+        match viewer {
+            Some((viewer_id, role)) if Some(viewer_id) == record.owner_id || role == "admin" => {
+                Ok(())
+            }
+            _ => Err(AppError::NotFound("File not found".to_string())),
+        }
+    }
+
+    pub fn authorize_write(
+        record: &FileRecord,
+        actor_id: Uuid,
+        role: &str,
+    ) -> Result<(), AppError> {
+        if Some(actor_id) == record.owner_id || role == "admin" {
+            Ok(())
+        } else {
+            Err(AppError::NotFound("File not found".to_string()))
+        }
+    }
+
+    pub async fn open_file(
+        state: &Arc<AppState>,
+        record: &FileRecord,
+    ) -> Result<(fs::File, u64), AppError> {
+        let path = Self::path_for(state, &record.storage_key)?;
+        let file = fs::File::open(&path)
+            .await
+            .map_err(|_| AppError::NotFound("File not found".to_string()))?;
+        let len = file
+            .metadata()
+            .await
+            .map(|m| m.len())
+            .unwrap_or(record.size_bytes.max(0) as u64);
+        Ok((file, len))
     }
 
     pub async fn delete_file(
         state: &Arc<AppState>,
-        filename: &str,
+        record: &FileRecord,
     ) -> Result<String, AppError> {
-        if filename.contains("..") || filename.contains('/') || filename.contains('\\') {
-            return Err(AppError::BadRequest("Invalid filename".to_string()));
+        sqlx::query("UPDATE files SET deleted_at = now() WHERE id = $1 AND deleted_at IS NULL")
+            .bind(record.id)
+            .execute(&state.db)
+            .await?;
+
+        // The row is already tombstoned, so the object is unreachable either way;
+        // a stranded blob is a cleanup concern, not a request failure.
+        match Self::path_for(state, &record.storage_key) {
+            Ok(path) => {
+                if let Err(e) = fs::remove_file(&path).await {
+                    tracing::warn!(file_id = %record.id, error = %e, "Failed to remove stored object");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(file_id = %record.id, error = %e, "Invalid storage key on delete")
+            }
         }
 
-        let file_path = format!("{}/{}", state.config.upload_dir, filename);
-        if !fs::try_exists(&file_path).await.unwrap_or(false) {
-            return Err(AppError::NotFound(format!("File '{filename}' not found")));
-        }
-
-        fs::remove_file(&file_path)
-            .await
-            .map_err(|e| AppError::Internal(format!("Failed to delete file: {e}").into()))?;
-
-        Ok(format!("File '{filename}' deleted successfully"))
+        Ok(format!(
+            "File '{}' deleted successfully",
+            record.original_name
+        ))
     }
 
-    pub fn generate_presigned_url(
-        _state: &Arc<AppState>,
-        req: PresignedUploadRequest,
+    // -- signed URLs --------------------------------------------------------
+
+    fn signing_payload(method: &str, key: &str, expires_at: i64) -> String {
+        format!("{method}\n{key}\n{expires_at}")
+    }
+
+    /// Issue a signed, expiring grant to upload directly against a reserved key.
+    pub fn generate_presigned_upload(
+        state: &Arc<AppState>,
+        req: &PresignedUploadRequest,
     ) -> Result<PresignedUploadResponse, AppError> {
+        let content_type = req.content_type.trim().to_ascii_lowercase();
+        Self::ensure_mime_allowed(state, &content_type)?;
+
+        if req
+            .size_bytes
+            .is_some_and(|size| size > state.config.max_upload_bytes)
+        {
+            return Err(AppError::PayloadTooLarge(format!(
+                "Declared size exceeds the {} byte limit",
+                state.config.max_upload_bytes
+            )));
+        }
+
         let file_id = Uuid::now_v7();
-        let ext = Path::new(&req.filename)
-            .extension()
-            .and_then(|e| e.to_str())
-            .unwrap_or("bin")
-            .to_lowercase();
+        let storage_key = format!("{file_id}.{}", Self::extension_for(&content_type));
+        let expires_at = Utc::now() + Duration::seconds(state.config.signed_url_ttl_seconds);
+        let signature = crypto::sign(
+            &state.config.url_signing_key,
+            &Self::signing_payload("PUT", &storage_key, expires_at.timestamp()),
+        );
 
-        let key = format!("{file_id}.{ext}");
-        let upload_url = format!("/api/v1/files/upload"); // In S3/R2 mode, this would be an AWS SigV4 signed URL
-        let file_url = format!("/api/v1/files/{key}");
-
+        let base = state.config.public_base_url.trim_end_matches('/');
         Ok(PresignedUploadResponse {
-            key,
-            upload_url,
-            file_url,
-            expires_in_seconds: 900, // 15 mins
+            upload_url: format!(
+                "{base}/api/v1/files/upload?key={storage_key}&expires={}&signature={signature}",
+                expires_at.timestamp()
+            ),
+            file_url: format!("{base}/api/v1/files/{file_id}"),
+            storage_key,
+            expires_at,
+            expires_in_seconds: state.config.signed_url_ttl_seconds,
+            max_bytes: state.config.max_upload_bytes,
         })
+    }
+
+    /// Issue a signed, expiring download URL for a private file, so it can be
+    /// handed to a browser or CDN without exposing a bearer token.
+    pub fn generate_signed_download(
+        state: &Arc<AppState>,
+        record: &FileRecord,
+    ) -> SignedUrlResponse {
+        let expires_at = Utc::now() + Duration::seconds(state.config.signed_url_ttl_seconds);
+        let signature = crypto::sign(
+            &state.config.url_signing_key,
+            &Self::signing_payload("GET", &record.id.to_string(), expires_at.timestamp()),
+        );
+
+        SignedUrlResponse {
+            url: format!(
+                "{}/api/v1/files/{}?expires={}&signature={signature}",
+                state.config.public_base_url.trim_end_matches('/'),
+                record.id,
+                expires_at.timestamp()
+            ),
+            expires_at,
+            expires_in_seconds: state.config.signed_url_ttl_seconds,
+        }
+    }
+
+    /// Verify a signature and its expiry. Returns `true` only if both hold.
+    pub fn verify_signature(
+        state: &Arc<AppState>,
+        method: &str,
+        key: &str,
+        expires: i64,
+        signature: &str,
+    ) -> bool {
+        let Some(expires_at) = DateTime::from_timestamp(expires, 0) else {
+            return false;
+        };
+        if expires_at <= Utc::now() {
+            return false;
+        }
+        crypto::verify_signature(
+            &state.config.url_signing_key,
+            &Self::signing_payload(method, key, expires),
+            signature,
+        )
+    }
+}
+
+fn sanitize_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| !c.is_control() && *c != '/' && *c != '\\')
+        .take(255)
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        "unnamed_file".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn normalize_visibility(value: &str) -> Result<&'static str, AppError> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "" | "private" => Ok("private"),
+        "public" => Ok("public"),
+        other => Err(AppError::BadRequest(format!(
+            "Unknown visibility '{other}' (expected 'private' or 'public')"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sniffing_ignores_a_misleading_extension() {
+        // A PNG named .txt is still typed as a PNG.
+        assert_eq!(
+            StorageService::sniff_mime(b"\x89PNG\r\n\x1a\n\x00\x00", "notes.txt"),
+            "image/png"
+        );
+        // An executable renamed to .png is not accepted as an image.
+        assert_eq!(
+            StorageService::sniff_mime(b"\x7fELF\x02\x01\x01\x00\x00", "avatar.png"),
+            "application/octet-stream"
+        );
+        assert_eq!(
+            StorageService::sniff_mime(b"%PDF-1.7", "x.bin"),
+            "application/pdf"
+        );
+        assert_eq!(
+            StorageService::sniff_mime(b"{\"a\":1}", "d.json"),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn storage_keys_reject_traversal() {
+        assert!(StorageService::validate_storage_key("0193.png").is_ok());
+        for bad in ["../etc/passwd", "a/b.png", "..", ".hidden", "a\\b.png", ""] {
+            assert!(
+                StorageService::validate_storage_key(bad).is_err(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn filenames_are_sanitized() {
+        assert_eq!(sanitize_filename("../../etc/passwd"), "....etcpasswd");
+        assert_eq!(sanitize_filename("   "), "unnamed_file");
+        assert_eq!(sanitize_filename("report.pdf"), "report.pdf");
     }
 }

@@ -1,7 +1,11 @@
 [package]
 name = "axum-template"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Production-ready Axum API scaffold: session-backed auth, owned storage, realtime, and an append-only audit log"
+readme = "README.md"
 
 [dependencies]
 # Web & Async
@@ -31,6 +35,11 @@ jsonwebtoken = "9.3"
 argon2 = { version = "0.5", features = ["std"] }
 oauth2 = "5.0"
 rand = "0.9"
+sha2 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+chacha20poly1305 = { version = "0.10", features = ["std"] }
+subtle = "2.6"
 lettre = { version = "0.11", default-features = false, features = ["tokio1-rustls-tls", "smtp-transport", "builder"] }
 
 # Observability & Logging
@@ -57,6 +66,12 @@ bytes = "1.10"
 tokio-util = { version = "0.7", features = ["io"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
 
 [dev-dependencies]
 tower = { version = "0.5", features = ["util"] }

@@ -1,40 +1,86 @@
+//! Credential and session management.
+//!
+//! Two design changes drive this module:
+//!
+//! * **Sessions are the source of truth.** The access token is a short-lived
+//!   bearer credential naming a session row; that row is what gets revoked when a
+//!   user signs out, is banned, or changes their password. A stateless JWT alone
+//!   cannot be withdrawn, so bans and role changes could not previously take
+//!   effect until the token expired.
+//! * **Recovery tokens are scoped and hashed.** Each carries an explicit purpose
+//!   and is stored only as a SHA-256 digest, so an email-verification token can
+//!   no longer be replayed against the password-reset endpoint and a database
+//!   read does not yield usable tokens.
+
 use std::sync::Arc;
+
 use argon2::{
-    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
-    Argon2,
+    Algorithm, Argon2, Params, Version,
+    password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString, rand_core::OsRng},
 };
-use chrono::{Duration, Utc};
-use jsonwebtoken::{decode, encode, DecodingKey, EncodingKey, Header, Validation};
-use rand::{distr::Alphanumeric, Rng};
+use chrono::{DateTime, Duration, Utc};
+use jsonwebtoken::{DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use serde::{Deserialize, Serialize};
+use sqlx::{PgPool, Postgres, Transaction};
 use uuid::Uuid;
 
 use crate::{
     config::AppConfig,
+    crypto,
     error::AppError,
     models::user::{
-        Account, AuthResponse, ForgetPasswordRequest, ResetPasswordRequest, SignInEmailRequest,
-        SignUpEmailRequest, User, Verification, VerifyEmailRequest,
+        Account, AuthResponse, ChangePasswordRequest, CredentialRow, ForgetPasswordRequest,
+        ResetPasswordRequest, Session, SessionUserRow, SignInEmailRequest, SignUpEmailRequest,
+        TokenPurpose, USER_COLUMNS, UpdateUserRequest, User, UserResponse, VerifyEmailRequest,
     },
+    services::{audit::AuditService, mail::MailService},
     state::AppState,
 };
 
+/// A dummy Argon2 hash of a random value, verified against when an account does
+/// not exist so that sign-in costs the same either way. Without it, response
+/// latency reveals which addresses are registered.
+const DUMMY_HASH: &str =
+    "$argon2id$v=19$m=19456,t=2,p=1$c29tZXNhbHRzb21lc2FsdA$RdescudvJCsgt3ub+b+dWRWJTmaaJObG";
+
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Claims {
-    pub sub: String, // User ID (UUID)
+    /// User ID (UUID).
+    pub sub: String,
+    /// Session ID. Looked up on every request so revocation takes effect at once.
+    pub sid: String,
     pub email: String,
     pub role: String,
     pub exp: usize,
     pub iat: usize,
 }
 
+/// Request metadata recorded against sessions and audit entries.
+#[derive(Debug, Clone, Default)]
+pub struct RequestContext {
+    pub ip_address: Option<String>,
+    pub user_agent: Option<String>,
+}
+
 pub struct AuthService;
 
 impl AuthService {
-    pub fn hash_password(password: &str) -> Result<String, AppError> {
+    // -- password hashing ---------------------------------------------------
+
+    fn argon2(config: &AppConfig) -> Result<Argon2<'static>, AppError> {
+        let params = Params::new(
+            config.argon2.memory_kib,
+            config.argon2.iterations,
+            config.argon2.parallelism,
+            None,
+        )
+        .map_err(|e| AppError::Internal(format!("Invalid Argon2 parameters: {e}").into()))?;
+        Ok(Argon2::new(Algorithm::Argon2id, Version::V0x13, params))
+    }
+
+    pub fn hash_password(password: &str, config: &AppConfig) -> Result<String, AppError> {
         let salt = SaltString::generate(&mut OsRng);
-        let argon2 = Argon2::default();
-        argon2
+        Self::argon2(config)?
             .hash_password(password.as_bytes(), &salt)
             .map(|h| h.to_string())
             .map_err(|e| AppError::Internal(format!("Password hashing failed: {e}").into()))
@@ -43,25 +89,38 @@ impl AuthService {
     pub fn verify_password(password: &str, password_hash: &str) -> Result<bool, AppError> {
         let parsed_hash = PasswordHash::new(password_hash)
             .map_err(|e| AppError::Internal(format!("Invalid password hash format: {e}").into()))?;
+        // Verification reads its parameters from the stored hash, so records
+        // written under older Argon2 settings keep working.
         Ok(Argon2::default()
             .verify_password(password.as_bytes(), &parsed_hash)
             .is_ok())
     }
 
-    pub fn generate_random_token(len: usize) -> String {
-        rand::rng()
-            .sample_iter(&Alphanumeric)
-            .take(len)
-            .map(char::from)
-            .collect()
+    /// Burn the same CPU as a real verification, to keep sign-in constant-time
+    /// with respect to account existence.
+    fn verify_dummy_password(password: &str) {
+        if let Ok(parsed) = PasswordHash::new(DUMMY_HASH) {
+            let _ = Argon2::default().verify_password(password.as_bytes(), &parsed);
+        }
     }
 
-    pub fn generate_jwt(user: &User, config: &AppConfig) -> Result<String, AppError> {
+    pub fn generate_random_token(len: usize) -> String {
+        crypto::random_token(len)
+    }
+
+    // -- access tokens ------------------------------------------------------
+
+    pub fn generate_access_token(
+        user: &User,
+        session_id: Uuid,
+        config: &AppConfig,
+    ) -> Result<String, AppError> {
         let now = Utc::now();
-        let expires_at = now + Duration::hours(config.jwt_expiration_hours);
+        let expires_at = now + Duration::minutes(config.access_token_ttl_minutes);
 
         let claims = Claims {
             sub: user.id.to_string(),
+            sid: session_id.to_string(),
             email: user.email.clone(),
             role: user.role.clone(),
             iat: now.timestamp() as usize,
@@ -71,125 +130,447 @@ impl AuthService {
         encode(
             &Header::default(),
             &claims,
-            &EncodingKey::from_secret(config.jwt_secret.as_bytes()),
+            &EncodingKey::from_secret(config.jwt_secret.expose().as_bytes()),
         )
         .map_err(|e| AppError::Internal(format!("JWT encoding failed: {e}").into()))
     }
 
-    pub fn verify_jwt(token: &str, jwt_secret: &str) -> Result<Claims, AppError> {
-        let token_data = decode::<Claims>(
+    pub fn verify_access_token(token: &str, jwt_secret: &str) -> Result<Claims, AppError> {
+        decode::<Claims>(
             token,
             &DecodingKey::from_secret(jwt_secret.as_bytes()),
             &Validation::default(),
         )
-        .map_err(|_| AppError::Unauthorized("Invalid or expired authentication token".to_string()))?;
-
-        Ok(token_data.claims)
+        .map(|data| data.claims)
+        .map_err(|_| AppError::Unauthorized("Invalid or expired authentication token".to_string()))
     }
+
+    // -- sessions -----------------------------------------------------------
+
+    /// Create a session and return `(session_id, plaintext refresh token)`.
+    /// Only the digest is persisted.
+    async fn create_session(
+        tx: &mut Transaction<'_, Postgres>,
+        user_id: Uuid,
+        config: &AppConfig,
+        ctx: &RequestContext,
+    ) -> Result<(Uuid, String), AppError> {
+        let session_id = Uuid::now_v7();
+        let refresh_token = crypto::random_token(48);
+        let expires_at = Utc::now() + Duration::days(config.refresh_token_ttl_days);
+
+        sqlx::query(
+            r#"
+            INSERT INTO sessions (id, user_id, refresh_token_hash, expires_at, ip_address, user_agent)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .bind(crypto::sha256_hex(&refresh_token))
+        .bind(expires_at)
+        .bind(ctx.ip_address.as_deref())
+        .bind(ctx.user_agent.as_deref())
+        .execute(&mut **tx)
+        .await?;
+
+        Ok((session_id, refresh_token))
+    }
+
+    /// Session creation for callers outside this module (the OAuth flow), which
+    /// must enrol a session inside their own transaction.
+    pub async fn create_oauth_session(
+        tx: &mut Transaction<'_, Postgres>,
+        user_id: Uuid,
+        config: &AppConfig,
+        ctx: &RequestContext,
+    ) -> Result<(Uuid, String), AppError> {
+        Self::create_session(tx, user_id, config, ctx).await
+    }
+
+    /// Resolve the session named by an access token, rejecting it if the session
+    /// was revoked or expired, or the user was banned or deleted since issuance.
+    ///
+    /// This is the per-request check that makes revocation real.
+    pub async fn resolve_session(
+        db: &PgPool,
+        user_id: Uuid,
+        session_id: Uuid,
+    ) -> Result<User, AppError> {
+        let row = sqlx::query_as::<_, SessionUserRow>(
+            r#"
+            SELECT u.id, u.name, u.email, u.email_verified, u.image, u.role, u.banned,
+                   u.created_at, u.updated_at,
+                   s.revoked_at, s.expires_at AS session_expires_at
+            FROM sessions s
+            JOIN users u ON u.id = s.user_id
+            WHERE s.id = $1 AND s.user_id = $2 AND u.deleted_at IS NULL
+            "#,
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .fetch_optional(db)
+        .await?;
+
+        let row =
+            row.ok_or_else(|| AppError::Unauthorized("Session no longer exists".to_string()))?;
+
+        if row.revoked_at.is_some() {
+            return Err(AppError::Unauthorized(
+                "Session has been revoked".to_string(),
+            ));
+        }
+        if row.session_expires_at <= Utc::now() {
+            return Err(AppError::Unauthorized("Session has expired".to_string()));
+        }
+        if row.banned {
+            return Err(AppError::Forbidden(
+                "This account has been suspended".to_string(),
+            ));
+        }
+
+        let user: User = row.into();
+        Ok(user)
+    }
+
+    /// Rotate a refresh token. The presented token is consumed as the new one is
+    /// issued, inside a single transaction.
+    pub async fn refresh_session(
+        state: &Arc<AppState>,
+        refresh_token: &str,
+        ctx: &RequestContext,
+    ) -> Result<AuthResponse, AppError> {
+        let token_hash = crypto::sha256_hex(refresh_token);
+        let mut tx = state.db.begin().await?;
+
+        // Match the live token first, then the superseded one. A hit on the
+        // latter means a token that was already rotated has been presented
+        // again, which is the signature of a stolen token being replayed.
+        let session = sqlx::query_as::<_, Session>(
+            r#"
+            SELECT id, user_id, expires_at, revoked_at
+            FROM sessions
+            WHERE refresh_token_hash = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(&token_hash)
+        .fetch_optional(&mut *tx)
+        .await?;
+
+        let replayed = if session.is_none() {
+            sqlx::query_as::<_, Session>(
+                r#"
+                SELECT id, user_id, expires_at, revoked_at
+                FROM sessions
+                WHERE previous_token_hash = $1
+                FOR UPDATE
+                "#,
+            )
+            .bind(&token_hash)
+            .fetch_optional(&mut *tx)
+            .await?
+        } else {
+            None
+        };
+
+        if let Some(compromised) = replayed {
+            // Revoke the whole family: we cannot tell whether the legitimate
+            // client or the attacker holds the current token, so both must
+            // re-authenticate.
+            sqlx::query(
+                "UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+            )
+            .bind(compromised.user_id)
+            .execute(&mut *tx)
+            .await?;
+            tx.commit().await?;
+
+            tracing::warn!(
+                user_id = %compromised.user_id,
+                "Rotated refresh token replayed; all sessions for the user were revoked"
+            );
+            return Err(AppError::Unauthorized(
+                "Refresh token has already been used. Please sign in again.".to_string(),
+            ));
+        }
+
+        let session =
+            session.ok_or_else(|| AppError::Unauthorized("Invalid refresh token".to_string()))?;
+
+        if session.revoked_at.is_some() {
+            return Err(AppError::Unauthorized(
+                "Session has been revoked. Please sign in again.".to_string(),
+            ));
+        }
+
+        if session.expires_at <= Utc::now() {
+            return Err(AppError::Unauthorized(
+                "Refresh token has expired".to_string(),
+            ));
+        }
+
+        let user = sqlx::query_as::<_, User>(&format!(
+            "SELECT {USER_COLUMNS} FROM users WHERE id = $1 AND deleted_at IS NULL"
+        ))
+        .bind(session.user_id)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::Unauthorized("Account no longer exists".to_string()))?;
+
+        if user.banned {
+            return Err(AppError::Forbidden(
+                "This account has been suspended".to_string(),
+            ));
+        }
+
+        let new_refresh = crypto::random_token(48);
+        let new_expiry = Utc::now() + Duration::days(state.config.refresh_token_ttl_days);
+        sqlx::query(
+            r#"
+            UPDATE sessions
+            SET previous_token_hash = refresh_token_hash,
+                refresh_token_hash = $2,
+                expires_at = $3,
+                rotated_at = now(),
+                last_used_at = now(),
+                ip_address = COALESCE($4, ip_address),
+                user_agent = COALESCE($5, user_agent)
+            WHERE id = $1
+            "#,
+        )
+        .bind(session.id)
+        .bind(crypto::sha256_hex(&new_refresh))
+        .bind(new_expiry)
+        .bind(ctx.ip_address.as_deref())
+        .bind(ctx.user_agent.as_deref())
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+
+        let access_token = Self::generate_access_token(&user, session.id, &state.config)?;
+        Ok(AuthResponse {
+            access_token,
+            refresh_token: new_refresh,
+            token_type: "Bearer".to_string(),
+            expires_in: state.config.access_token_ttl_minutes * 60,
+            session_id: session.id,
+            user: user.into(),
+        })
+    }
+
+    pub async fn sign_out(
+        state: &Arc<AppState>,
+        user_id: Uuid,
+        session_id: Uuid,
+        ctx: &RequestContext,
+    ) -> Result<String, AppError> {
+        sqlx::query(
+            "UPDATE sessions SET revoked_at = now() WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL",
+        )
+        .bind(session_id)
+        .bind(user_id)
+        .execute(&state.db)
+        .await?;
+
+        AuditService::record_best_effort(
+            state,
+            Some(user_id),
+            "session.signed_out",
+            "session",
+            Some(&session_id.to_string()),
+            ctx,
+            None,
+        )
+        .await;
+
+        Ok("Signed out successfully".to_string())
+    }
+
+    pub async fn sign_out_all(
+        state: &Arc<AppState>,
+        user_id: Uuid,
+        ctx: &RequestContext,
+    ) -> Result<String, AppError> {
+        let revoked = sqlx::query(
+            "UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .execute(&state.db)
+        .await?
+        .rows_affected();
+
+        AuditService::record_best_effort(
+            state,
+            Some(user_id),
+            "session.signed_out_all",
+            "session",
+            None,
+            ctx,
+            Some(serde_json::json!({ "sessions_revoked": revoked })),
+        )
+        .await;
+
+        Ok(format!("Revoked {revoked} session(s)"))
+    }
+
+    // -- recovery tokens ----------------------------------------------------
+
+    /// Issue a purpose-scoped, single-use token. Returns the plaintext, which is
+    /// the only point at which it exists in readable form.
+    async fn issue_verification_token(
+        tx: &mut Transaction<'_, Postgres>,
+        identifier: &str,
+        purpose: TokenPurpose,
+        ttl: Duration,
+    ) -> Result<String, AppError> {
+        // Supersede any outstanding token of the same purpose, so a leaked older
+        // token cannot be used after a fresh one is requested.
+        sqlx::query(
+            "UPDATE verifications SET consumed_at = now() \
+             WHERE identifier = $1 AND purpose = $2 AND consumed_at IS NULL",
+        )
+        .bind(identifier)
+        .bind(purpose.as_str())
+        .execute(&mut **tx)
+        .await?;
+
+        let token = crypto::random_token(48);
+        sqlx::query(
+            r#"
+            INSERT INTO verifications (id, identifier, purpose, token_hash, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(identifier)
+        .bind(purpose.as_str())
+        .bind(crypto::sha256_hex(&token))
+        .bind(Utc::now() + ttl)
+        .execute(&mut **tx)
+        .await?;
+
+        Ok(token)
+    }
+
+    /// Consume a token, enforcing purpose, expiry, and single use in one atomic
+    /// statement so a token cannot be redeemed twice concurrently.
+    async fn consume_verification_token(
+        tx: &mut Transaction<'_, Postgres>,
+        token: &str,
+        purpose: TokenPurpose,
+    ) -> Result<String, AppError> {
+        let identifier: Option<String> = sqlx::query_scalar(
+            r#"
+            UPDATE verifications
+            SET consumed_at = now()
+            WHERE token_hash = $1
+              AND purpose = $2
+              AND consumed_at IS NULL
+              AND expires_at > now()
+            RETURNING identifier
+            "#,
+        )
+        .bind(crypto::sha256_hex(token))
+        .bind(purpose.as_str())
+        .fetch_optional(&mut **tx)
+        .await?;
+
+        identifier.ok_or_else(|| {
+            AppError::BadRequest("Invalid, expired, or already-used token".to_string())
+        })
+    }
+
+    // -- registration and sign-in -------------------------------------------
 
     pub async fn sign_up_email(
         state: &Arc<AppState>,
         req: SignUpEmailRequest,
+        ctx: &RequestContext,
     ) -> Result<AuthResponse, AppError> {
+        let email = req.email.trim().to_ascii_lowercase();
         let mut tx = state.db.begin().await?;
 
-        // 1. Check if user already exists
+        // The unique index on live emails is the real guard; this check only
+        // turns the common case into a clean 409 instead of a constraint error.
         let exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)",
+            "SELECT EXISTS(SELECT 1 FROM users WHERE email = $1 AND deleted_at IS NULL)",
         )
-        .bind(&req.email)
+        .bind(&email)
         .fetch_one(&mut *tx)
         .await?;
-
         if exists {
-            return Err(AppError::Conflict("User with this email already exists".to_string()));
+            return Err(AppError::Conflict(
+                "User with this email already exists".to_string(),
+            ));
         }
 
         let user_id = Uuid::now_v7();
-        let account_id = Uuid::now_v7();
-        let now = Utc::now();
-        let password_hash = Self::hash_password(&req.password)?;
+        let password_hash = Self::hash_password(&req.password, &state.config)?;
 
-        // 2. Insert into users table
-        let user = sqlx::query_as::<_, User>(
+        let user = sqlx::query_as::<_, User>(&format!(
             r#"
-            INSERT INTO users (id, name, email, email_verified, image, role, banned, created_at, updated_at)
-            VALUES ($1, $2, $3, false, $4, 'user', false, $5, $6)
-            RETURNING id, name, email, email_verified, image, role, banned, created_at, updated_at
-            "#,
-        )
+            INSERT INTO users (id, name, email, email_verified, image, role, banned)
+            VALUES ($1, $2, $3, false, $4, 'user', false)
+            RETURNING {USER_COLUMNS}
+            "#
+        ))
         .bind(user_id)
-        .bind(&req.name)
-        .bind(&req.email)
+        .bind(req.name.trim())
+        .bind(&email)
         .bind(&req.image)
-        .bind(now)
-        .bind(now)
         .fetch_one(&mut *tx)
         .await?;
 
-        // 3. Insert credentials into accounts table
         sqlx::query(
             r#"
-            INSERT INTO accounts (id, user_id, account_id, provider_id, password, created_at, updated_at)
-            VALUES ($1, $2, $3, 'credential', $4, $5, $6)
-            "#,
-        )
-        .bind(account_id)
-        .bind(user_id)
-        .bind(&req.email)
-        .bind(&password_hash)
-        .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
-        // 4. Generate verification token for email
-        let verify_token = Self::generate_random_token(32);
-        let expires_at = now + Duration::hours(24);
-
-        sqlx::query(
-            r#"
-            INSERT INTO verifications (id, identifier, value, expires_at, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
+            INSERT INTO accounts (id, user_id, account_id, provider_id, password)
+            VALUES ($1, $2, $3, 'credential', $4)
             "#,
         )
         .bind(Uuid::now_v7())
-        .bind(&req.email)
-        .bind(&verify_token)
-        .bind(expires_at)
-        .bind(now)
-        .bind(now)
+        .bind(user_id)
+        .bind(&email)
+        .bind(&password_hash)
         .execute(&mut *tx)
         .await?;
 
-        // 4. Send verification email via MailService (Mailpit / SMTP)
-        let config = state.config.clone();
-        let recipient = user.email.clone();
-        let token_val = verify_token.clone();
-        tokio::spawn(async move {
-            let body = format!(
-                "<h2>Welcome!</h2><p>Please verify your account using code: <b>{}</b></p>",
-                token_val
-            );
-            let _ = crate::services::mail::MailService::send_email(
-                &config,
-                &recipient,
-                "Verify your email",
-                &body,
-            )
-            .await;
-        });
+        let verify_token = Self::issue_verification_token(
+            &mut tx,
+            &email,
+            TokenPurpose::EmailVerify,
+            Duration::hours(state.config.email_verify_ttl_hours),
+        )
+        .await?;
+
+        let (session_id, refresh_token) =
+            Self::create_session(&mut tx, user_id, &state.config, ctx).await?;
 
         tx.commit().await?;
 
-        tracing::info!(email = %req.email, verify_token = %verify_token, "Email verification token generated");
+        // Only after the transaction commits, so a rolled-back registration
+        // cannot produce a live verification email.
+        MailService::send_verification_email(state, &email, &verify_token);
 
-        let token = Self::generate_jwt(&user, &state.config)?;
+        AuditService::record_best_effort(
+            state,
+            Some(user_id),
+            "user.signed_up",
+            "user",
+            Some(&user_id.to_string()),
+            ctx,
+            None,
+        )
+        .await;
 
+        let access_token = Self::generate_access_token(&user, session_id, &state.config)?;
         Ok(AuthResponse {
-            access_token: token,
+            access_token,
+            refresh_token,
             token_type: "Bearer".to_string(),
-            expires_in: state.config.jwt_expiration_hours * 3600,
+            expires_in: state.config.access_token_ttl_minutes * 60,
+            session_id,
             user: user.into(),
         })
     }
@@ -197,77 +578,164 @@ impl AuthService {
     pub async fn sign_in_email(
         state: &Arc<AppState>,
         req: SignInEmailRequest,
+        ctx: &RequestContext,
     ) -> Result<AuthResponse, AppError> {
-        let user = sqlx::query_as::<_, User>(
-            "SELECT id, name, email, email_verified, image, role, banned, created_at, updated_at FROM users WHERE email = $1",
+        let email = req.email.trim().to_ascii_lowercase();
+
+        let record = sqlx::query_as::<_, CredentialRow>(
+            r#"
+            SELECT u.id, u.name, u.email, u.email_verified, u.image, u.role, u.banned,
+                   u.created_at, u.updated_at,
+                   a.password, u.locked_until
+            FROM users u
+            LEFT JOIN accounts a ON a.user_id = u.id AND a.provider_id = 'credential'
+            WHERE u.email = $1 AND u.deleted_at IS NULL
+            "#,
         )
-        .bind(&req.email)
+        .bind(&email)
         .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::Unauthorized("Invalid email or password".to_string()))?;
+        .await?;
+
+        let Some(row) = record else {
+            // Spend the same work as a real verification before failing, so
+            // response time does not disclose whether the address is registered.
+            Self::verify_dummy_password(&req.password);
+            return Err(AppError::Unauthorized(
+                "Invalid email or password".to_string(),
+            ));
+        };
+        let (password_hash, locked_until) = (row.password.clone(), row.locked_until);
+        let user: User = row.into();
 
         if user.banned {
-            return Err(AppError::Forbidden("This account has been suspended".to_string()));
+            return Err(AppError::Forbidden(
+                "This account has been suspended".to_string(),
+            ));
         }
 
-        let account = sqlx::query_as::<_, Account>(
-            "SELECT id, user_id, account_id, provider_id, password, access_token, refresh_token, access_token_expires_at, created_at, updated_at FROM accounts WHERE user_id = $1 AND provider_id = 'credential'",
+        if locked_until.is_some_and(|until| until > Utc::now()) {
+            return Err(AppError::TooManyRequests(
+                "Too many failed sign-in attempts. Try again later.".to_string(),
+            ));
+        }
+
+        let Some(password_hash) = password_hash else {
+            // Social-only account: same timing, same message.
+            Self::verify_dummy_password(&req.password);
+            return Err(AppError::Unauthorized(
+                "Invalid email or password".to_string(),
+            ));
+        };
+
+        if !Self::verify_password(&req.password, &password_hash)? {
+            Self::register_failed_login(state, user.id, ctx).await?;
+            return Err(AppError::Unauthorized(
+                "Invalid email or password".to_string(),
+            ));
+        }
+
+        let mut tx = state.db.begin().await?;
+        sqlx::query(
+            "UPDATE users SET failed_login_attempts = 0, locked_until = NULL WHERE id = $1",
         )
         .bind(user.id)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::Unauthorized("Account uses social login".to_string()))?;
+        .execute(&mut *tx)
+        .await?;
+        let (session_id, refresh_token) =
+            Self::create_session(&mut tx, user.id, &state.config, ctx).await?;
+        tx.commit().await?;
 
-        let password_hash = account
-            .password
-            .as_ref()
-            .ok_or_else(|| AppError::Unauthorized("Password not configured".to_string()))?;
+        AuditService::record_best_effort(
+            state,
+            Some(user.id),
+            "user.signed_in",
+            "session",
+            Some(&session_id.to_string()),
+            ctx,
+            None,
+        )
+        .await;
 
-        if !Self::verify_password(&req.password, password_hash)? {
-            return Err(AppError::Unauthorized("Invalid email or password".to_string()));
-        }
-
-        let token = Self::generate_jwt(&user, &state.config)?;
-
+        let access_token = Self::generate_access_token(&user, session_id, &state.config)?;
         Ok(AuthResponse {
-            access_token: token,
+            access_token,
+            refresh_token,
             token_type: "Bearer".to_string(),
-            expires_in: state.config.jwt_expiration_hours * 3600,
+            expires_in: state.config.access_token_ttl_minutes * 60,
+            session_id,
             user: user.into(),
         })
     }
 
+    /// Per-account lockout, complementing the per-IP rate limit: an attacker
+    /// spreading attempts across many addresses still cannot brute-force one
+    /// account.
+    async fn register_failed_login(
+        state: &Arc<AppState>,
+        user_id: Uuid,
+        ctx: &RequestContext,
+    ) -> Result<(), AppError> {
+        let locked: Option<DateTime<Utc>> = sqlx::query_scalar(
+            r#"
+            UPDATE users
+            SET failed_login_attempts = failed_login_attempts + 1,
+                locked_until = CASE
+                    WHEN failed_login_attempts + 1 >= $2 THEN now() + make_interval(mins => $3)
+                    ELSE locked_until
+                END
+            WHERE id = $1
+            RETURNING locked_until
+            "#,
+        )
+        .bind(user_id)
+        .bind(state.config.lockout_threshold)
+        .bind(state.config.lockout_minutes as i32)
+        .fetch_one(&state.db)
+        .await?;
+
+        if locked.is_some_and(|until| until > Utc::now()) {
+            AuditService::record_best_effort(
+                state,
+                Some(user_id),
+                "user.locked_out",
+                "user",
+                Some(&user_id.to_string()),
+                ctx,
+                None,
+            )
+            .await;
+        }
+        Ok(())
+    }
+
+    // -- account recovery ---------------------------------------------------
+
     pub async fn verify_email(
         state: &Arc<AppState>,
         req: VerifyEmailRequest,
+        ctx: &RequestContext,
     ) -> Result<String, AppError> {
-        let now = Utc::now();
-        let verification = sqlx::query_as::<_, Verification>(
-            "SELECT id, identifier, value, expires_at, created_at, updated_at FROM verifications WHERE value = $1 AND expires_at > $2",
-        )
-        .bind(&req.token)
-        .bind(now)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::BadRequest("Invalid or expired verification token".to_string()))?;
-
         let mut tx = state.db.begin().await?;
+        let identifier =
+            Self::consume_verification_token(&mut tx, &req.token, TokenPurpose::EmailVerify)
+                .await?;
 
-        sqlx::query(
-            "UPDATE users SET email_verified = true, updated_at = $2 WHERE email = $1",
-        )
-        .bind(&verification.identifier)
-        .bind(now)
-        .execute(&mut *tx)
-        .await?;
-
-        sqlx::query("DELETE FROM verifications WHERE id = $1")
-            .bind(verification.id)
+        sqlx::query("UPDATE users SET email_verified = true, updated_at = now() WHERE email = $1")
+            .bind(&identifier)
             .execute(&mut *tx)
             .await?;
-
         tx.commit().await?;
 
+        AuditService::record_best_effort(
+            state,
+            None,
+            "user.email_verified",
+            "user",
+            None,
+            ctx,
+            None,
+        )
+        .await;
         Ok("Email verified successfully".to_string())
     }
 
@@ -275,125 +743,115 @@ impl AuthService {
         state: &Arc<AppState>,
         req: ForgetPasswordRequest,
     ) -> Result<String, AppError> {
+        const NEUTRAL: &str = "If that email is registered, a password reset link has been sent";
+        let email = req.email.trim().to_ascii_lowercase();
+
         let exists = sqlx::query_scalar::<_, bool>(
-            "SELECT EXISTS(SELECT 1 FROM users WHERE email = $1)",
+            "SELECT EXISTS(SELECT 1 FROM users WHERE email = $1 AND deleted_at IS NULL)",
         )
-        .bind(&req.email)
+        .bind(&email)
         .fetch_one(&state.db)
         .await?;
 
-        // Always return success to prevent email enumeration attacks
         if !exists {
-            return Ok("If the email exists, a password reset token has been generated".to_string());
+            return Ok(NEUTRAL.to_string());
         }
 
-        let reset_token = Self::generate_random_token(32);
-        let now = Utc::now();
-        let expires_at = now + Duration::hours(1);
-
-        sqlx::query(
-            r#"
-            INSERT INTO verifications (id, identifier, value, expires_at, created_at, updated_at)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            "#,
+        let mut tx = state.db.begin().await?;
+        let reset_token = Self::issue_verification_token(
+            &mut tx,
+            &email,
+            TokenPurpose::PasswordReset,
+            Duration::minutes(state.config.password_reset_ttl_minutes),
         )
-        .bind(Uuid::now_v7())
-        .bind(&req.email)
-        .bind(&reset_token)
-        .bind(expires_at)
-        .bind(now)
-        .bind(now)
-        .execute(&state.db)
         .await?;
+        tx.commit().await?;
 
-        // Send reset password email via MailService (Mailpit / SMTP)
-        let config = state.config.clone();
-        let recipient = req.email.clone();
-        let token_val = reset_token.clone();
-        tokio::spawn(async move {
-            let body = format!(
-                "<h2>Password Reset Request</h2><p>Reset your password using token: <b>{}</b></p>",
-                token_val
-            );
-            let _ = crate::services::mail::MailService::send_email(
-                &config,
-                &recipient,
-                "Reset your password",
-                &body,
-            )
-            .await;
-        });
-
-        tracing::info!(email = %req.email, reset_token = %reset_token, "Password reset token generated");
-        Ok("If your email is registered, you will receive a password reset token".to_string())
+        MailService::send_password_reset_email(state, &email, &reset_token);
+        Ok(NEUTRAL.to_string())
     }
 
     pub async fn reset_password(
         state: &Arc<AppState>,
         req: ResetPasswordRequest,
+        ctx: &RequestContext,
     ) -> Result<String, AppError> {
-        let now = Utc::now();
-        let verification = sqlx::query_as::<_, Verification>(
-            "SELECT id, identifier, value, expires_at, created_at, updated_at FROM verifications WHERE value = $1 AND expires_at > $2",
-        )
-        .bind(&req.token)
-        .bind(now)
-        .fetch_optional(&state.db)
-        .await?
-        .ok_or_else(|| AppError::BadRequest("Invalid or expired reset token".to_string()))?;
-
-        let user = sqlx::query_as::<_, User>(
-            "SELECT id, name, email, email_verified, image, role, banned, created_at, updated_at FROM users WHERE email = $1",
-        )
-        .bind(&verification.identifier)
-        .fetch_one(&state.db)
-        .await?;
-
-        let new_password_hash = Self::hash_password(&req.new_password)?;
-
+        let new_password_hash = Self::hash_password(&req.new_password, &state.config)?;
         let mut tx = state.db.begin().await?;
 
+        // Only a token minted for password reset is accepted here.
+        let identifier =
+            Self::consume_verification_token(&mut tx, &req.token, TokenPurpose::PasswordReset)
+                .await?;
+
+        let user = sqlx::query_as::<_, User>(&format!(
+            "SELECT {USER_COLUMNS} FROM users WHERE email = $1 AND deleted_at IS NULL"
+        ))
+        .bind(&identifier)
+        .fetch_optional(&mut *tx)
+        .await?
+        .ok_or_else(|| AppError::BadRequest("Invalid or expired token".to_string()))?;
+
         sqlx::query(
-            "UPDATE accounts SET password = $2, updated_at = $3 WHERE user_id = $1 AND provider_id = 'credential'",
+            "UPDATE accounts SET password = $2, updated_at = now() \
+             WHERE user_id = $1 AND provider_id = 'credential'",
         )
         .bind(user.id)
         .bind(&new_password_hash)
-        .bind(now)
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query("DELETE FROM verifications WHERE id = $1")
-            .bind(verification.id)
-            .execute(&mut *tx)
-            .await?;
+        sqlx::query(
+            "UPDATE users SET failed_login_attempts = 0, locked_until = NULL, updated_at = now() WHERE id = $1",
+        )
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
+
+        // A password reset must not leave an attacker's session alive.
+        sqlx::query(
+            "UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user.id)
+        .execute(&mut *tx)
+        .await?;
 
         tx.commit().await?;
 
-        Ok("Password has been reset successfully".to_string())
+        AuditService::record_best_effort(
+            state,
+            Some(user.id),
+            "user.password_reset",
+            "user",
+            Some(&user.id.to_string()),
+            ctx,
+            None,
+        )
+        .await;
+        Ok("Password has been reset successfully. All sessions were signed out.".to_string())
     }
+
+    // -- profile ------------------------------------------------------------
 
     pub async fn update_profile(
         state: &Arc<AppState>,
         user_id: Uuid,
-        req: crate::models::user::UpdateUserRequest,
-    ) -> Result<crate::models::user::UserResponse, AppError> {
-        let now = Utc::now();
-        let user = sqlx::query_as::<_, User>(
+        req: UpdateUserRequest,
+    ) -> Result<UserResponse, AppError> {
+        let user = sqlx::query_as::<_, User>(&format!(
             r#"
             UPDATE users
-            SET name = COALESCE($2, name),
-                image = COALESCE($3, image),
-                updated_at = $4
-            WHERE id = $1
-            RETURNING id, name, email, email_verified, image, role, banned, created_at, updated_at
-            "#,
-        )
+            SET name = COALESCE($2, name), image = COALESCE($3, image), updated_at = now()
+            WHERE id = $1 AND deleted_at IS NULL
+            RETURNING {USER_COLUMNS}
+            "#
+        ))
         .bind(user_id)
-        .bind(req.name)
-        .bind(req.image)
-        .bind(now)
-        .fetch_one(&state.db)
-        .await?;
+        .bind(req.name.as_deref().map(str::trim))
+        .bind(req.image.as_deref())
+        .fetch_optional(&state.db)
+        .await?
+        .ok_or_else(|| AppError::NotFound("User not found".to_string()))?;
 
         Ok(user.into())
     }
@@ -401,15 +859,21 @@ impl AuthService {
     pub async fn change_password(
         state: &Arc<AppState>,
         user_id: Uuid,
-        req: crate::models::user::ChangePasswordRequest,
+        current_session: Uuid,
+        req: ChangePasswordRequest,
+        ctx: &RequestContext,
     ) -> Result<String, AppError> {
         let account = sqlx::query_as::<_, Account>(
-            "SELECT id, user_id, account_id, provider_id, password, access_token, refresh_token, access_token_expires_at, created_at, updated_at FROM accounts WHERE user_id = $1 AND provider_id = 'credential'",
+            "SELECT id, user_id, account_id, provider_id, password, access_token, refresh_token, \
+             access_token_expires_at, created_at, updated_at \
+             FROM accounts WHERE user_id = $1 AND provider_id = 'credential'",
         )
         .bind(user_id)
         .fetch_optional(&state.db)
         .await?
-        .ok_or_else(|| AppError::BadRequest("User has no password account configured (OAuth login)".to_string()))?;
+        .ok_or_else(|| {
+            AppError::BadRequest("This account signs in with a social provider".to_string())
+        })?;
 
         let password_hash = account
             .password
@@ -417,38 +881,98 @@ impl AuthService {
             .ok_or_else(|| AppError::BadRequest("Password not set".to_string()))?;
 
         if !Self::verify_password(&req.current_password, password_hash)? {
-            return Err(AppError::Unauthorized("Incorrect current password".to_string()));
+            return Err(AppError::Unauthorized(
+                "Incorrect current password".to_string(),
+            ));
         }
 
-        let new_hash = Self::hash_password(&req.new_password)?;
-        let now = Utc::now();
+        let new_hash = Self::hash_password(&req.new_password, &state.config)?;
+        let mut tx = state.db.begin().await?;
 
+        sqlx::query("UPDATE accounts SET password = $2, updated_at = now() WHERE id = $1")
+            .bind(account.id)
+            .bind(new_hash)
+            .execute(&mut *tx)
+            .await?;
+
+        // Every other session is dropped; the caller keeps the one they are on.
         sqlx::query(
-            "UPDATE accounts SET password = $2, updated_at = $3 WHERE id = $1",
+            "UPDATE sessions SET revoked_at = now() \
+             WHERE user_id = $1 AND id <> $2 AND revoked_at IS NULL",
         )
-        .bind(account.id)
-        .bind(new_hash)
-        .bind(now)
-        .execute(&state.db)
+        .bind(user_id)
+        .bind(current_session)
+        .execute(&mut *tx)
         .await?;
 
-        Ok("Password changed successfully".to_string())
+        tx.commit().await?;
+
+        AuditService::record_best_effort(
+            state,
+            Some(user_id),
+            "user.password_changed",
+            "user",
+            Some(&user_id.to_string()),
+            ctx,
+            None,
+        )
+        .await;
+        Ok("Password changed. Other sessions were signed out.".to_string())
     }
 
+    /// Soft delete: the row is retained (audit trails reference it) but the
+    /// account is deactivated, its sessions revoked, and its email released so
+    /// the address can be registered again.
     pub async fn delete_account(
         state: &Arc<AppState>,
         user_id: Uuid,
+        ctx: &RequestContext,
     ) -> Result<String, AppError> {
-        let rows_affected = sqlx::query("DELETE FROM users WHERE id = $1")
-            .bind(user_id)
-            .execute(&state.db)
-            .await?
-            .rows_affected();
+        let mut tx = state.db.begin().await?;
 
-        if rows_affected == 0 {
+        let affected = sqlx::query(
+            r#"
+            UPDATE users
+            SET deleted_at = now(),
+                email = 'deleted+' || id::text || '@invalid',
+                name = 'Deleted user',
+                image = NULL,
+                updated_at = now()
+            WHERE id = $1 AND deleted_at IS NULL
+            "#,
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+
+        if affected == 0 {
             return Err(AppError::NotFound("User not found".to_string()));
         }
 
+        sqlx::query(
+            "UPDATE sessions SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+        )
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query("DELETE FROM accounts WHERE user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+
+        AuditService::record_best_effort(
+            state,
+            Some(user_id),
+            "user.deleted",
+            "user",
+            Some(&user_id.to_string()),
+            ctx,
+            None,
+        )
+        .await;
         Ok("Account deleted successfully".to_string())
     }
 }

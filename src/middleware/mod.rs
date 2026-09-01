@@ -1,4 +1,4 @@
-﻿pub mod auth;
+pub mod auth;
 pub mod idempotency;
 pub mod metrics;
 pub mod rate_limit;

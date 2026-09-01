@@ -1,10 +1,18 @@
-﻿use std::sync::Arc;
-use chrono::Utc;
+//! In-app notifications, with realtime delivery.
+//!
+//! `create` previously had no callers, so both this feed and the SSE stream that
+//! depends on it were permanently empty. It is now called from the auth and
+//! storage paths, and publishes through Postgres so every replica's connected
+//! clients receive the event.
+
+use std::sync::Arc;
+
 use uuid::Uuid;
 
 use crate::{
     error::AppError,
     models::events::{Notification, RealtimeEvent},
+    services::realtime::RealtimeService,
     state::AppState,
 };
 
@@ -18,40 +26,47 @@ impl NotificationService {
         body: &str,
         data: Option<serde_json::Value>,
     ) -> Result<Notification, AppError> {
-        let notif_id = Uuid::now_v7();
-        let now = Utc::now();
-
-        // 1. Insert in-app notification record
         let notif = sqlx::query_as::<_, Notification>(
             r#"
-            INSERT INTO notifications (id, user_id, title, body, read, data, created_at)
-            VALUES ($1, $2, $3, $4, false, $5, $6)
+            INSERT INTO notifications (id, user_id, title, body, read, data)
+            VALUES ($1, $2, $3, $4, false, $5)
             RETURNING id, user_id, title, body, read, data, created_at
             "#,
         )
-        .bind(notif_id)
+        .bind(Uuid::now_v7())
         .bind(user_id)
         .bind(title)
         .bind(body)
         .bind(&data)
-        .bind(now)
         .fetch_one(&state.db)
         .await?;
 
-        // 2. Broadcast realtime SSE event to user's active connection
-        let event = RealtimeEvent {
-            id: Uuid::now_v7(),
-            event_type: "notification.created".to_string(),
-            target_user_id: Some(user_id),
-            payload: serde_json::to_value(&notif).unwrap_or_default(),
-            timestamp: now,
-        };
-
-        let _ = state.realtime_tx.send(event);
-
-        tracing::info!(user_id = %user_id, title = %title, "Notification dispatched and broadcasted");
+        RealtimeService::publish_best_effort(
+            state,
+            &RealtimeEvent {
+                id: Uuid::now_v7(),
+                event_type: "notification.created".to_string(),
+                target_user_id: Some(user_id),
+                payload: serde_json::to_value(&notif).unwrap_or_default(),
+                timestamp: notif.created_at,
+            },
+        )
+        .await;
 
         Ok(notif)
+    }
+
+    /// Notify without failing the operation that triggered it.
+    pub async fn notify_best_effort(
+        state: &Arc<AppState>,
+        user_id: Uuid,
+        title: &str,
+        body: &str,
+        data: Option<serde_json::Value>,
+    ) {
+        if let Err(e) = Self::create(state, user_id, title, body, data).await {
+            tracing::warn!(%user_id, title, error = %e, "Failed to create notification");
+        }
     }
 
     pub async fn mark_as_read(
@@ -59,19 +74,17 @@ impl NotificationService {
         user_id: Uuid,
         notification_id: Uuid,
     ) -> Result<String, AppError> {
-        let rows = sqlx::query(
-            "UPDATE notifications SET read = true WHERE id = $1 AND user_id = $2",
-        )
-        .bind(notification_id)
-        .bind(user_id)
-        .execute(&state.db)
-        .await?
-        .rows_affected();
+        let rows =
+            sqlx::query("UPDATE notifications SET read = true WHERE id = $1 AND user_id = $2")
+                .bind(notification_id)
+                .bind(user_id)
+                .execute(&state.db)
+                .await?
+                .rows_affected();
 
         if rows == 0 {
             return Err(AppError::NotFound("Notification not found".to_string()));
         }
-
         Ok("Notification marked as read".to_string())
     }
 
@@ -79,13 +92,13 @@ impl NotificationService {
         state: &Arc<AppState>,
         user_id: Uuid,
     ) -> Result<String, AppError> {
-        sqlx::query(
-            "UPDATE notifications SET read = true WHERE user_id = $1 AND read = false",
-        )
-        .bind(user_id)
-        .execute(&state.db)
-        .await?;
+        let rows =
+            sqlx::query("UPDATE notifications SET read = true WHERE user_id = $1 AND read = false")
+                .bind(user_id)
+                .execute(&state.db)
+                .await?
+                .rows_affected();
 
-        Ok("All notifications marked as read".to_string())
+        Ok(format!("Marked {rows} notification(s) as read"))
     }
 }

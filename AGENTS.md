@@ -1,113 +1,268 @@
-﻿# Axum Production Template - Architecture & Agent Manifesto
+# Axum Production Template — Architecture & Agent Manifesto
 
-> **Mission:** Protect production, eliminate technical debt, prevent "masuk angin" bloatware, and maintain high-performance, strictly-typed Rust backend excellence.
-
----
-
-## 1. Core Engineering Principles
-
-1. **Zero Bloat ("No Masuk Angin" Engineering):**
-   - No unnecessary abstraction layers, dynamic document proxies, or 12-container microservice clusters for basic features.
-   - Every system feature is native, in-process, compile-time verified, and runs under 20MB RAM.
-2. **Strict Compile-Time Correctness:**
-   - Single source of truth: Rust structs + `utoipa` + `serde` + `sqlx`.
-   - Never write redundant types. One struct derives JSON serialization, database row mapping, validation, and OpenAPI 3.1 documentation.
-3. **Hierarchical Route Composition (Zero Hardcoded Prefixes):**
-   - Handlers define relative paths (`#[utoipa::path(post, path = "/sign-up/email")]`).
-   - Routers compose hierarchically using `OpenApiRouter::nest("/api/v1", v1_router)`.
-4. **PostgreSQL & UUID v7 Standard:**
-   - All primary keys across all tables are sortable `Uuid::now_v7()`.
-   - Schema matches Better Auth conventions (`users`, `accounts`, `verifications`, `notifications`, `audit_logs`).
-5. **Standard API Contract:**
-   - Success: `ApiResponse<T>` -> `{ "success": true, "data": T, "meta": ... }`
-   - Failure: `ApiErrorResponse` -> `{ "success": false, "error": { "code": "...", "message": "...", "details": ... } }`
+> **Mission:** protect production, eliminate technical debt, prevent bloatware, and
+> keep a high-performance, strictly-typed Rust backend honest about what it does.
 
 ---
 
-## 2. System Architecture & Capabilities
+## 0. The prime directive: claims must be executable
+
+This template previously documented a CSP it never sent, an "immutable" audit
+table nothing protected, and a presigned-URL feature that returned an unsigned
+static path. A security review found forty defects, five of them critical, and
+the gap between documentation and behaviour was the common thread.
+
+So the first rule outranks every other rule in this file:
+
+**Never describe a capability here that the code does not implement.** If a
+feature is aspirational, put it in §7 and mark it as such. If you remove a
+capability, remove its claim in the same commit. A reader must be able to take
+any sentence in this document and find the code that makes it true.
+
+Corollary: **a security property needs a test that fails without it.** Every
+item in §4 has a regression test. Adding a security control without one is
+incomplete work.
+
+---
+
+## 1. Core engineering principles
+
+1. **Zero bloat.** No unnecessary abstraction layers, no dynamic document
+   proxies, no twelve-container cluster for basic features. One binary and one
+   PostgreSQL database is the entire runtime dependency set — realtime fan-out
+   uses `LISTEN`/`NOTIFY` and idempotency uses a table, rather than adding Redis.
+2. **Strict compile-time correctness.** One struct derives JSON serialization,
+   row mapping, validation, and OpenAPI documentation. Never write redundant
+   types. Joined queries get a purpose-built `FromRow` row struct rather than a
+   tuple of structs, which sqlx cannot map.
+3. **Hierarchical route composition.** Handlers declare relative paths; routers
+   compose with `OpenApiRouter::nest`. No hardcoded prefixes.
+4. **PostgreSQL and UUIDv7.** All primary keys are sortable `Uuid::now_v7()`.
+   UUIDv7 is time-ordered and therefore *guessable*: it is an identifier, never a
+   capability. Anything reachable by ID needs an authorization check.
+5. **Standard API contract.**
+   - Success: `{ "success": true, "data": T, "meta": ... }`
+   - Failure: `{ "success": false, "error": { "code", "message", "details" } }`
+6. **Development defaults must not reach production.** Anything convenient
+   locally — open CORS, unauthenticated metrics, a mailer that logs instead of
+   sending, an encryption key derived from `JWT_SECRET` — is a hard startup error
+   when `APP_ENV=production`. See `AppConfig::load_from_env`.
+
+---
+
+## 2. Security model
+
+The template's security rests on five decisions. Change any of them only
+deliberately, and update the regression tests in the same commit.
+
+### 2.1 Sessions are the source of truth, not the token
+
+The access token is a short-lived (15 minute) JWT naming a **session row**. Every
+authenticated request resolves that row, joined against the user, and rejects it
+if the session was revoked or expired or the user was banned or deleted. That
+round trip is what makes a ban, a sign-out, a password change, or a role change
+take effect immediately.
+
+Refresh tokens are opaque, stored only as SHA-256 digests, and **rotate on every
+use**. The superseded digest is retained in `previous_token_hash`: presenting an
+already-rotated token is the signature of a stolen token being replayed, and it
+revokes every session for that user.
+
+Never read `role` or `banned` from token claims for an authorization decision.
+`AuthUser` and `AdminUser` already carry the database's answer.
+
+### 2.2 Recovery tokens are purpose-scoped, hashed, and single-use
+
+`verifications` rows carry an explicit `purpose` (`email_verify` or
+`password_reset`), enforced by a `CHECK` constraint and filtered on at
+consumption. Tokens are stored only as digests, and consumption is a single
+atomic `UPDATE ... RETURNING`, so a token cannot be redeemed twice concurrently.
+
+Never add a token type without a purpose value. An unscoped token is a
+cross-endpoint replay waiting to happen.
+
+### 2.3 Every object has an owner
+
+Uploads get a `files` row carrying `owner_id` and `visibility`. Reads and deletes
+authorize against that row. Callers who may not see a file receive `404`, not
+`403`, so the endpoint cannot be used to enumerate IDs.
+
+Stored MIME types come from **sniffing the leading bytes**, never from the
+supplied filename or `Content-Type`. Storage keys are generated and validated
+against a strict character allowlist, so traversal is impossible by construction
+rather than by blocklist.
+
+### 2.4 Secrets never reach a log line
+
+Credentials are wrapped in `crypto::Secret`, whose `Debug` and `Display` both
+redact; the only way out is `.expose()`, which makes every disclosure greppable.
+`AppConfig`'s hand-written `Debug` redacts the key material it holds directly.
+
+Never log a recovery token, a rendered mail body, a session token, or a
+configuration field holding credentials. Log identifiers and event names.
+
+### 2.5 Untrusted input never picks its own bucket
+
+`X-Forwarded-For` is honoured only when `TRUST_PROXY_HEADERS=true`, because a
+caller who chooses their apparent IP also chooses their rate-limit bucket and the
+client IP recorded in the audit trail. The default is the peer address.
+
+Idempotency keys are scoped to `(identity, method, path, body hash, key)`. A key
+alone must never address a cache entry: that let one caller receive another's
+response, access token included.
+
+---
+
+## 3. System architecture
 
 ```text
-┌────────────────────────────────────────────────────────────────────────┐
-│                          Axum 0.8+ HTTP API                            │
-│  - Smart-IP Rate Limiting (tower_governor)                              │
-│  - Idempotency Replay Protection (Idempotency-Key)                     │
-│  - Prometheus Metrics Exporter (/metrics)                              │
-│  - Strict Security Headers (HSTS, CSP, X-Frame-Options)                │
-└───────────────────────────────────┬────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────────────┐
+│                            Axum 0.8 HTTP API                             │
+│  outermost → innermost                                                   │
+│    request-id → trace → outcome counter → timeout → body limit → CORS    │
+│    → global rate limit → security headers → idempotency                  │
+│    → [routing] → route metrics (MatchedPath) → auth rate limit → handler │
+└───────────────────────────────────┬──────────────────────────────────────┘
                                     │
        ┌────────────────────────────┼────────────────────────────┐
        ▼                            ▼                            ▼
-┌───────────────┐          ┌─────────────────┐          ┌─────────────────┐
-│ /api/v1/auth  │          │  /api/v1/users  │          │  /api/v1/files  │
-│ - Email Auth  │          │ - /me (Profile) │          │ - Stream Upload │
-│ - Google/GH   │          │ - /password     │          │ - Presigned URL │
-│ - BetterAuth  │          │ - Admin List    │          │ - Safe Download │
-│   RPC Aliases │          │   (AdminUser)   │          │ - Delete File   │
-└───────┬───────┘          └────────┬────────┘          └────────┬────────┘
-        │                           │                            │
+┌───────────────┐          ┌─────────────────┐          ┌──────────────────┐
+│ /api/v1/auth  │          │  /api/v1/users  │          │  /api/v1/files   │
+│ - Email auth  │          │ - /me profile   │          │ - Streaming      │
+│ - Sessions +  │          │ - /me/password  │          │   upload + sniff │
+│   refresh     │          │ - Admin list    │          │ - Signed URLs    │
+│ - OAuth+PKCE  │          │   (AdminUser)   │          │ - Owner ACLs     │
+│ - BetterAuth  │          │                 │          │                  │
+│   RPC aliases │          │                 │          │                  │
+└───────┬───────┘          └────────┬────────┘          └────────┬─────────┘
         └───────────────────────────┼────────────────────────────┘
                                     │
        ┌────────────────────────────┼────────────────────────────┐
        ▼                            ▼                            ▼
-┌──────────────────┐       ┌─────────────────┐          ┌─────────────────┐
-│ /api/v1/realtime │       │/notifications   │          │/api/v1/audit-logs│
-│ - Tokio SSE      │       │- In-App Feed    │          │- Immutable Log  │
-│   Stream         │       │- Mark Read      │          │- Admin RBAC     │
-│ - 15s Heartbeat  │       │- SSE Trigger    │          │  (AdminUser)    │
-└──────────────────┘       └─────────────────┘          └─────────────────┘
+┌──────────────────┐       ┌─────────────────┐          ┌──────────────────┐
+│ /api/v1/realtime │       │ /notifications  │          │ /api/v1/audit-   │
+│ - SSE stream     │       │ - Cursor feed   │          │   logs           │
+│ - Cross-replica  │◀──────│ - Publishes via │          │ - Append-only    │
+│   via LISTEN/    │       │   pg_notify     │          │   (DB trigger)   │
+│   NOTIFY         │       │ - Mark read     │          │ - Admin RBAC     │
+│ - Lag signalled  │       │                 │          │ - Keyset paging  │
+└──────────────────┘       └─────────────────┘          └──────────────────┘
+                                    │
+                          ┌─────────▼─────────┐
+                          │    PostgreSQL     │
+                          │ users, accounts,  │
+                          │ sessions, files,  │
+                          │ verifications,    │
+                          │ oauth_requests,   │
+                          │ idempotency_keys, │
+                          │ notifications,    │
+                          │ audit_logs        │
+                          └───────────────────┘
 ```
+
+**Middleware order matters.** Metrics are split in two on purpose: the route
+metric runs *inside* routing via `route_layer`, so `MatchedPath` is available and
+labels stay bounded by the route template; a separate outermost counter catches
+rate-limit rejections and timeouts, which never reach a route. Never label a
+metric with `req.uri().path()` — that is an unbounded, anonymously-driven memory
+leak in the registry.
 
 ---
 
-## 3. Directory Layout
+## 4. Regression-protected invariants
+
+Each of these has a test that fails if the property is lost. Do not weaken one
+without deleting its test, and do not delete its test.
+
+| Invariant | Test |
+|---|---|
+| An idempotency key cannot replay another caller's response | `idempotency_key_cannot_replay_another_users_response` |
+| A genuine retry still replays | `idempotency_key_replays_the_same_callers_identical_request` |
+| An email-verification token cannot reset a password | `email_verification_token_cannot_reset_a_password` |
+| A reset token works once, for its own purpose only | `password_reset_token_works_for_its_own_purpose` |
+| Private files resist anonymous read and cross-user delete | `files_are_not_readable_or_deletable_by_strangers` |
+| Banning invalidates a live token | `banning_a_user_invalidates_their_live_token` |
+| Sign-out revokes immediately | `signing_out_revokes_the_access_token_immediately` |
+| Demotion takes effect without waiting for expiry | `demoting_an_admin_takes_effect_without_waiting_for_expiry` |
+| Refresh tokens rotate, and replay revokes the family | `refresh_rotates_the_token_and_detects_replay` |
+| Metric cardinality does not grow with distinct paths | `metric_labels_do_not_grow_with_distinct_paths` |
+| Unknown and known accounts are indistinguishable | `unknown_and_known_accounts_return_the_same_rejection` |
+| Audit rows cannot be updated or deleted | `audit_log_rows_cannot_be_modified_or_deleted` |
+| Uploads are typed by content, not filename | `uploads_are_typed_by_content_not_by_filename` |
+| Signed URLs grant access and reject tampering | `signed_download_urls_grant_access_and_reject_tampering` |
+| Production refuses unsafe defaults | `config::tests::production_refuses_unsafe_defaults` |
+| The config struct is safe to log | `config::tests::debug_output_contains_no_secrets` |
+
+---
+
+## 5. Directory layout
 
 ```text
 src/
-├── bin/
-│   └── export_openapi.rs       # Standalone OpenAPI JSON exporter CLI
-├── config/                     # Strongly-typed environment configuration (AppConfig)
-├── error/                      # Unified error handling & standard JSON envelopes
+├── bin/export_openapi.rs   # OpenAPI JSON exporter; CI checks the spec is current
+├── config/                 # Typed configuration + production safety gates
+├── crypto/                 # Secret wrapper, hashing, HMAC signing, AEAD at rest
+├── error/                  # Error enum and the standard JSON envelopes
 ├── middleware/
-│   ├── auth.rs                 # JWT AuthUser & AdminUser RBAC extractors
-│   ├── idempotency.rs          # Mutation replay protection middleware
-│   ├── metrics.rs              # Prometheus metrics recorder middleware
-│   ├── rate_limit.rs           # Smart-IP rate limiter (tower_governor)
-│   └── security_headers.rs     # Security headers injector
-├── models/
-│   ├── events.rs               # Realtime, Notifications, and AuditLog DTOs
-│   ├── pagination.rs           # Standard PageParams, PageMeta, CursorParams
-│   ├── upload.rs               # Multipart & Presigned upload DTOs
-│   └── user.rs                 # User, Account, Verification, Auth DTOs
-├── routes/
-│   ├── health.rs               # /health and /metrics endpoints
-│   ├── mod.rs                  # Root router merging health & /api/v1
-│   └── v1/
-│       ├── audit.rs            # Compliance audit log endpoints (Admin only)
-│       ├── auth.rs             # Better Auth compatible auth suite & RPC aliases
-│       ├── files.rs            # Streaming multipart & presigned file storage
-│       ├── mod.rs              # v1 sub-router composition
-│       ├── notifications.rs    # In-app notifications feed
-│       ├── realtime.rs         # Server-Sent Events (SSE) stream
-│       └── users.rs            # User profile management & RBAC admin query
+│   ├── auth.rs             # AuthUser / AdminUser / OptionalAuthUser / RequestContext
+│   ├── idempotency.rs      # Scoped, Postgres-backed replay protection
+│   ├── metrics.rs          # MatchedPath route metrics + outermost outcome counter
+│   ├── rate_limit.rs       # Configurable limits and proxy-header trust
+│   └── security_headers.rs # CSP, Permissions-Policy, conditional HSTS
+├── models/                 # Request/response DTOs, row structs, pagination
+├── routes/                 # health + v1/{auth,users,files,notifications,realtime,audit}
 ├── services/
-│   ├── audit.rs                # Async audit logger
-│   ├── auth.rs                 # Argon2id hashing, JWT, Better Auth business logic
-│   ├── mail.rs                 # Async transactional SMTP mailer (lettre)
-│   ├── notification.rs         # In-app notification engine with realtime push
-│   ├── oauth.rs                # Google & GitHub OAuth2 state/code exchange
-│   └── storage.rs              # Streaming multipart file I/O & presigned URLs
-├── state/                      # Global AppState (Db pool, Config, Realtime broadcast)
-├── lib.rs                      # ApiDoc OpenAPI declaration & app factory
-└── main.rs                     # Tokio server entrypoint
+│   ├── audit.rs            # Append-only audit trail
+│   ├── auth.rs             # Argon2id, sessions, recovery tokens, lockout
+│   ├── mail.rs             # SMTP with TLS and credentials
+│   ├── notification.rs     # In-app notifications, published via pg_notify
+│   ├── oauth.rs            # OAuth2 + PKCE, server-side state validation
+│   ├── realtime.rs         # LISTEN/NOTIFY bridge and publisher
+│   └── storage.rs          # StorageBackend trait, sniffing, signed URLs
+├── state/                  # AppState (pool, config, realtime channel, metrics)
+├── lib.rs                  # OpenAPI declaration and app factory
+└── main.rs                 # Entrypoint: migrations, listener task, cleanup loop
 ```
 
 ---
 
-## 4. Key Agent Instructions & Rules
+## 6. Rules for agents working here
 
-1. **Keep It DRY:** When adding aliases or alternative API conventions (e.g. Better Auth RPC vs REST), always delegate to the same underlying `Service` method. Never duplicate database queries or business logic.
-2. **Preserve Hierarchical Routing:** Always register new handlers relative to their sub-router (`routes/v1/{module}.rs`) and compose with `OpenApiRouter::nest()`.
-3. **Verify All 3 Checks Before Finishing Any Task:**
-   - `cargo check` (Zero warnings/errors)
-   - `cargo test` (All integration tests green)
-   - `cargo run --bin export_openapi` (Keep `openapi.json` synchronized)
+1. **Keep it DRY.** Alternative API conventions (Better Auth RPC vs REST)
+   delegate to the same service method. Never duplicate a query or a rule.
+2. **Preserve hierarchical routing.** Register handlers on their sub-router and
+   compose with `nest`.
+3. **Authorize at the row, not the route.** A handler that loads something by ID
+   must check who is asking before returning it.
+4. **Add a migration, never edit a released one.** sqlx checksums applied
+   migrations; editing one breaks every existing deployment.
+5. **Run the full gate before finishing any task:**
+   ```bash
+   cargo fmt --all --check
+   cargo clippy --all-targets -- -D warnings   # zero warnings, not "few"
+   cargo test                                   # requires DATABASE_URL
+   cargo run --bin export_openapi               # keep openapi.json in sync
+   ```
+6. **Tests talk to a real database.** `TestApp::spawn` connects and migrates.
+   Never reintroduce a lazy pool that lets a test pass without touching
+   PostgreSQL — that is how the original suite reported 8/8 green while covering
+   none of the business logic.
+
+---
+
+## 7. Deliberately not implemented
+
+Recorded so nobody mistakes absence for oversight.
+
+- **S3/R2 storage backend.** `StorageBackend` is the seam and `LocalBackend` is
+  the only implementation. Local disk does not survive container replacement and
+  is invisible to other replicas, so a real deployment needs an S3 backend
+  written against this trait. Signed URLs and ACLs are already backend-agnostic.
+- **Projects, teams, and a declarative permission model.** The multi-tenant
+  primitives a full backend-as-a-service offers. Ownership is currently a single
+  `owner_id` column.
+- **Server-side API keys and outbound webhooks.**
+- **Dynamic collections and a functions runtime.** Deliberately rejected, not
+  merely absent: dynamic documents would give up the compile-time typing that is
+  this template's main advantage, and a functions runtime is exactly the
+  container cluster §1 rules out.

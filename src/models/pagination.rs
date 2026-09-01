@@ -1,4 +1,4 @@
-﻿use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Serialize};
 use utoipa::{IntoParams, ToSchema};
 
 /// Standard Page-Based Query Parameters
@@ -47,7 +47,7 @@ impl PageMeta {
         let total_pages = if total_count == 0 {
             0
         } else {
-            (total_count + page_size - 1) / page_size
+            total_count.div_ceil(page_size)
         };
 
         Self {
@@ -87,4 +87,95 @@ pub struct CursorMeta {
     pub next_cursor: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub previous_cursor: Option<String>,
+}
+
+/// Opaque keyset cursor for append-only feeds.
+///
+/// `OFFSET` pagination re-scans everything it skips, so it degrades on exactly
+/// the high-volume tables (audit logs, notifications) that need paging most.
+/// Encoding the last row's sort key instead keeps every page a constant-cost
+/// index seek, and it does not skip or duplicate rows when new ones arrive
+/// mid-traversal.
+#[derive(Debug, Clone, Copy)]
+pub struct Cursor {
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub id: uuid::Uuid,
+}
+
+impl Cursor {
+    pub fn encode(&self) -> String {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        URL_SAFE_NO_PAD.encode(format!(
+            "{}|{}",
+            self.created_at.timestamp_micros(),
+            self.id
+        ))
+    }
+
+    pub fn decode(raw: &str) -> Option<Self> {
+        use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+        let decoded = URL_SAFE_NO_PAD.decode(raw).ok()?;
+        let text = String::from_utf8(decoded).ok()?;
+        let (micros, id) = text.split_once('|')?;
+        Some(Self {
+            created_at: chrono::DateTime::from_timestamp_micros(micros.parse().ok()?)?,
+            id: id.parse().ok()?,
+        })
+    }
+}
+
+impl CursorMeta {
+    /// Build metadata from a page that was fetched with one extra row, which is
+    /// how "is there a next page" is answered without a second query.
+    pub fn from_page(limit: u64, has_next: bool, last: Option<Cursor>) -> Self {
+        Self {
+            limit,
+            has_next,
+            next_cursor: if has_next {
+                last.map(|c| c.encode())
+            } else {
+                None
+            },
+            previous_cursor: None,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cursor_round_trips() {
+        let cursor = Cursor {
+            created_at: chrono::Utc::now(),
+            id: uuid::Uuid::now_v7(),
+        };
+        let decoded = Cursor::decode(&cursor.encode()).expect("cursor should decode");
+        assert_eq!(decoded.id, cursor.id);
+        assert_eq!(
+            decoded.created_at.timestamp_micros(),
+            cursor.created_at.timestamp_micros()
+        );
+    }
+
+    #[test]
+    fn malformed_cursors_are_rejected_rather_than_panicking() {
+        for bad in ["", "!!!!", "Zm9v", "bm90LWEtY3Vyc29y"] {
+            assert!(
+                Cursor::decode(bad).is_none(),
+                "expected {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn page_meta_computes_bounds() {
+        let m = PageMeta::new(2, 20, 45);
+        assert_eq!(m.total_pages, 3);
+        assert!(m.has_next && m.has_previous);
+        let empty = PageMeta::new(1, 20, 0);
+        assert_eq!(empty.total_pages, 0);
+        assert!(!empty.has_next && !empty.has_previous);
+    }
 }

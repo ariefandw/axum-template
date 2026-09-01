@@ -1,7 +1,7 @@
-﻿use axum::{
+use axum::{
+    Json,
     http::StatusCode,
     response::{IntoResponse, Response},
-    Json,
 };
 use serde::Serialize;
 use thiserror::Error;
@@ -69,6 +69,15 @@ pub enum AppError {
     #[error("Conflict: {0}")]
     Conflict(String),
 
+    #[error("Payload too large: {0}")]
+    PayloadTooLarge(String),
+
+    #[error("Too many requests: {0}")]
+    TooManyRequests(String),
+
+    #[error("Service unavailable: {0}")]
+    ServiceUnavailable(String),
+
     #[error("Database error: {0}")]
     DatabaseError(#[from] sqlx::Error),
 
@@ -104,50 +113,69 @@ pub mod anyhow_error {
 impl IntoResponse for AppError {
     fn into_response(self) -> Response {
         let (status, code, message, details) = match &self {
-            AppError::BadRequest(msg) => (
-                StatusCode::BAD_REQUEST,
-                "BAD_REQUEST",
-                msg.clone(),
-                None,
-            ),
+            AppError::BadRequest(msg) => {
+                (StatusCode::BAD_REQUEST, "BAD_REQUEST", msg.clone(), None)
+            }
             AppError::ValidationError(msg) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "VALIDATION_ERROR",
                 msg.clone(),
                 None,
             ),
-            AppError::Unauthorized(msg) => (
-                StatusCode::UNAUTHORIZED,
-                "UNAUTHORIZED",
+            AppError::Unauthorized(msg) => {
+                (StatusCode::UNAUTHORIZED, "UNAUTHORIZED", msg.clone(), None)
+            }
+            AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, "FORBIDDEN", msg.clone(), None),
+            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, "NOT_FOUND", msg.clone(), None),
+            AppError::Conflict(msg) => (StatusCode::CONFLICT, "CONFLICT", msg.clone(), None),
+            AppError::PayloadTooLarge(msg) => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "PAYLOAD_TOO_LARGE",
                 msg.clone(),
                 None,
             ),
-            AppError::Forbidden(msg) => (
-                StatusCode::FORBIDDEN,
-                "FORBIDDEN",
+            AppError::TooManyRequests(msg) => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "TOO_MANY_REQUESTS",
                 msg.clone(),
                 None,
             ),
-            AppError::NotFound(msg) => (
-                StatusCode::NOT_FOUND,
-                "NOT_FOUND",
-                msg.clone(),
-                None,
-            ),
-            AppError::Conflict(msg) => (
-                StatusCode::CONFLICT,
-                "CONFLICT",
+            AppError::ServiceUnavailable(msg) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "SERVICE_UNAVAILABLE",
                 msg.clone(),
                 None,
             ),
             AppError::DatabaseError(err) => {
-                tracing::error!(target: "app::database", error = ?err, "Database query failed");
-                (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "DATABASE_ERROR",
-                    "A database error occurred".to_string(),
-                    None,
-                )
+                // A unique violation is a caller-visible conflict, not a server
+                // fault: it is how concurrent sign-ups for one address resolve.
+                if let sqlx::Error::Database(db_err) = err {
+                    if db_err.is_unique_violation() {
+                        tracing::debug!(target: "app::database", constraint = ?db_err.constraint(), "Unique violation");
+                        (
+                            StatusCode::CONFLICT,
+                            "CONFLICT",
+                            "That resource already exists".to_string(),
+                            None,
+                        )
+                    } else {
+                        tracing::error!(target: "app::database", error = ?db_err, "Database query failed");
+                        (
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "DATABASE_ERROR",
+                            "A database error occurred".to_string(),
+                            None,
+                        )
+                    }
+                } else {
+                    tracing::error!(target: "app::database", error = ?err, "Database query failed");
+                    (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "DATABASE_ERROR",
+                        "A database error occurred".to_string(),
+                        None,
+                    )
+                }
             }
             AppError::Internal(err) => {
                 tracing::error!(target: "app::internal", error = ?err, "Internal server error");
