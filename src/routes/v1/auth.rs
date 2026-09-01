@@ -199,6 +199,7 @@ pub async fn get_session(
 
 #[utoipa::path(
     post, path = "/update-user", request_body = UpdateUserRequest,
+    operation_id = "auth_update_user",
     responses((status = 200, description = "Profile updated", body = ApiResponse<UserResponse>)),
     security(("bearer_auth" = [])), tag = "Authentication"
 )]
@@ -214,6 +215,7 @@ pub async fn update_user(
 
 #[utoipa::path(
     post, path = "/change-password", request_body = ChangePasswordRequest,
+    operation_id = "auth_change_password",
     responses((status = 200, description = "Password changed", body = ApiResponse<String>)),
     security(("bearer_auth" = [])), tag = "Authentication"
 )]
@@ -237,6 +239,7 @@ pub async fn change_password(
 
 #[utoipa::path(
     post, path = "/delete-user",
+    operation_id = "auth_delete_user",
     responses((status = 200, description = "Account deleted", body = ApiResponse<String>)),
     security(("bearer_auth" = [])), tag = "Authentication"
 )]

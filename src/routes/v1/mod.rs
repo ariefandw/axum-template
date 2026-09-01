@@ -22,7 +22,6 @@ pub fn router(config: &AppConfig) -> OpenApiRouter<Arc<AppState>> {
         .nest("/api-keys", api_key::router())
         .nest("/apps", apps::router())
         .nest("/auth", auth::router().layer(auth_limiter))
-        .nest("/auth/api-key", api_key::router())
         .nest("/users", users::router())
         .nest("/files", files::router())
         .nest("/notifications", notifications::router())
