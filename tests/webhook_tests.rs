@@ -74,7 +74,7 @@ async fn webhook_lifecycle_hmac_signature_and_delivery() {
     // 3. Dispatch an event
     let event_payload = json!({ "order_id": 12345, "total": 99.50 });
     let dispatched =
-        WebhookService::dispatch_event(&app.state.db, "order.created", &event_payload, None)
+        WebhookService::dispatch_event(&app.state.db, "order.created", &event_payload, None, None)
             .await
             .expect("Dispatch failed");
 

@@ -23,6 +23,7 @@ use crate::{
 
 #[derive(Debug, Deserialize, IntoParams)]
 pub struct ListWebhookQuery {
+    pub app_id: Option<Uuid>,
     pub org_id: Option<Uuid>,
 }
 
@@ -70,7 +71,8 @@ pub async fn list_webhooks(
     Query(query): Query<ListWebhookQuery>,
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<ApiResponse<Vec<WebhookRecord>>>, AppError> {
-    let webhooks = WebhookService::list_webhooks(&state.db, auth_user.id, query.org_id).await?;
+    let webhooks =
+        WebhookService::list_webhooks(&state.db, auth_user.id, query.app_id, query.org_id).await?;
     Ok(Json(ApiResponse::success(webhooks)))
 }
 

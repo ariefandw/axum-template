@@ -11,6 +11,7 @@ use validator::Validate;
 #[derive(Debug, Clone, Serialize, Deserialize, FromRow, ToSchema)]
 pub struct WebhookRecord {
     pub id: Uuid,
+    pub app_id: Option<Uuid>,
     pub owner_id: Uuid,
     pub org_id: Option<Uuid>,
     pub target_url: String,
@@ -27,6 +28,7 @@ pub struct WebhookRecord {
 pub struct CreateWebhookRequest {
     #[validate(url(message = "target_url must be a valid HTTP/HTTPS URL"))]
     pub target_url: String,
+    pub app_id: Option<Uuid>,
     pub org_id: Option<Uuid>,
     #[validate(length(min = 1, message = "At least one event topic is required"))]
     pub events: Vec<String>,
@@ -36,6 +38,7 @@ pub struct CreateWebhookRequest {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct CreateWebhookResponse {
     pub id: Uuid,
+    pub app_id: Option<Uuid>,
     pub target_url: String,
     pub org_id: Option<Uuid>,
     pub events: Vec<String>,

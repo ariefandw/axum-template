@@ -2400,6 +2400,18 @@
         "operationId": "list_webhooks",
         "parameters": [
           {
+            "name": "app_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "format": "uuid"
+            }
+          },
+          {
             "name": "org_id",
             "in": "query",
             "required": false,
@@ -3006,6 +3018,13 @@
               "created_at"
             ],
             "properties": {
+              "app_id": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "format": "uuid"
+              },
               "created_at": {
                 "type": "string",
                 "format": "date-time"
@@ -3940,6 +3959,13 @@
                 "updated_at"
               ],
               "properties": {
+                "app_id": {
+                  "type": [
+                    "string",
+                    "null"
+                  ],
+                  "format": "uuid"
+                },
                 "created_at": {
                   "type": "string",
                   "format": "date-time"
@@ -4253,6 +4279,13 @@
           "events"
         ],
         "properties": {
+          "app_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
           "events": {
             "type": "array",
             "items": {
@@ -4282,6 +4315,13 @@
           "created_at"
         ],
         "properties": {
+          "app_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"
@@ -5082,6 +5122,13 @@
           "updated_at"
         ],
         "properties": {
+          "app_id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "format": "uuid"
+          },
           "created_at": {
             "type": "string",
             "format": "date-time"

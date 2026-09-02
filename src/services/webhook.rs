@@ -31,11 +31,12 @@ impl WebhookService {
         let record = sqlx::query_as!(
             WebhookRecord,
             r#"
-            INSERT INTO webhooks (id, owner_id, org_id, target_url, secret, events, is_active)
-            VALUES ($1, $2, $3, $4, $5, $6, true)
-            RETURNING id, owner_id, org_id, target_url, secret, events, is_active, created_at, updated_at
+            INSERT INTO webhooks (id, app_id, owner_id, org_id, target_url, secret, events, is_active)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, true)
+            RETURNING id, app_id, owner_id, org_id, target_url, secret, events, is_active, created_at, updated_at
             "#,
             id,
+            req.app_id,
             owner_id,
             req.org_id,
             req.target_url,
@@ -47,6 +48,7 @@ impl WebhookService {
 
         Ok(CreateWebhookResponse {
             id: record.id,
+            app_id: record.app_id,
             target_url: record.target_url,
             org_id: record.org_id,
             events: record.events,
@@ -55,42 +57,30 @@ impl WebhookService {
         })
     }
 
-    /// List active webhooks owned by a user or organization.
+    /// List active webhooks optionally scoped by app_id or org_id.
     pub async fn list_webhooks(
         pool: &PgPool,
         owner_id: Uuid,
+        app_id: Option<Uuid>,
         org_id: Option<Uuid>,
     ) -> Result<Vec<WebhookRecord>, AppError> {
-        let webhooks = match org_id {
-            Some(org) => {
-                sqlx::query_as!(
-                    WebhookRecord,
-                    r#"
-                    SELECT id, owner_id, org_id, target_url, secret, events, is_active, created_at, updated_at
-                    FROM webhooks
-                    WHERE org_id = $1 AND is_active = true
-                    ORDER BY created_at DESC
-                    "#,
-                    org
-                )
-                .fetch_all(pool)
-                .await?
-            }
-            None => {
-                sqlx::query_as!(
-                    WebhookRecord,
-                    r#"
-                    SELECT id, owner_id, org_id, target_url, secret, events, is_active, created_at, updated_at
-                    FROM webhooks
-                    WHERE owner_id = $1 AND is_active = true
-                    ORDER BY created_at DESC
-                    "#,
-                    owner_id
-                )
-                .fetch_all(pool)
-                .await?
-            }
-        };
+        let webhooks = sqlx::query_as!(
+            WebhookRecord,
+            r#"
+            SELECT id, app_id, owner_id, org_id, target_url, secret, events, is_active, created_at, updated_at
+            FROM webhooks
+            WHERE owner_id = $1
+              AND is_active = true
+              AND ($2::uuid IS NULL OR app_id = $2)
+              AND ($3::uuid IS NULL OR org_id = $3)
+            ORDER BY created_at DESC
+            "#,
+            owner_id,
+            app_id,
+            org_id
+        )
+        .fetch_all(pool)
+        .await?;
 
         Ok(webhooks)
     }
@@ -178,22 +168,25 @@ impl WebhookService {
         pool: &PgPool,
         event_type: &str,
         payload: &T,
+        app_id: Option<Uuid>,
         org_id: Option<Uuid>,
     ) -> Result<usize, AppError> {
         let payload_json = serde_json::to_value(payload).map_err(|e| {
             AppError::Internal(format!("Failed to serialize webhook payload: {}", e).into())
         })?;
 
-        // Find matching active webhooks
+        // Find matching active webhooks scoped to app_id and/or org_id
         let matching_webhooks = sqlx::query_as!(
             WebhookRecord,
             r#"
-            SELECT id, owner_id, org_id, target_url, secret, events, is_active, created_at, updated_at
+            SELECT id, app_id, owner_id, org_id, target_url, secret, events, is_active, created_at, updated_at
             FROM webhooks
             WHERE is_active = true
-              AND ($1::uuid IS NULL OR org_id IS NULL OR org_id = $1)
-              AND ('*' = ANY(events) OR $2 = ANY(events))
+              AND ($1::uuid IS NULL OR app_id IS NULL OR app_id = $1)
+              AND ($2::uuid IS NULL OR org_id IS NULL OR org_id = $2)
+              AND ('*' = ANY(events) OR $3 = ANY(events))
             "#,
+            app_id,
             org_id,
             event_type
         )
