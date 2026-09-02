@@ -280,6 +280,11 @@ without deleting its test, and do not delete its test.
 | Only the reserver may complete an upload | `a_stranger_cannot_complete_someone_elses_reservation` |
 | A forged or extended upload grant is refused | `signed_upload_rejects_a_tampered_grant` |
 | Abandoned reservations are reaped, completed files never | `abandoned_reservations_are_reapable` |
+| Background job queue enqueues and locks concurrently with SKIP LOCKED | `job_queue_enqueue_and_poll_with_skip_locked` |
+| Background jobs back off exponentially on failure | `job_queue_exponential_backoff_and_retry` |
+| Webhook deliveries compute HMAC signatures and execute asynchronously | `webhook_lifecycle_hmac_signature_and_delivery` |
+| AppContext guard enforces app membership and rejects outsiders | `app_context_guard_enforces_membership_and_rejects_outsiders` |
+| Remote JWKS verifier parses and caches keys | `jwks_verifier_parses_and_caches_remote_keys` |
 
 ---
 
@@ -289,30 +294,33 @@ without deleting its test, and do not delete its test.
 src/
 ├── bin/export_openapi.rs   # OpenAPI JSON exporter; CI checks the spec is current
 ├── config/                 # Typed configuration + production safety gates
-├── crypto/                 # Secret wrapper, hashing, HMAC signing, AEAD at rest
+├── crypto/                 # Secret wrapper, hashing, HMAC signing, AEAD at rest, JWKS verifier
 ├── error/                  # Error enum and the standard JSON envelopes
 ├── middleware/
+│   ├── app_context.rs      # Multi-app X-Application-ID extractor & guard
 │   ├── auth.rs             # Credential, AuthUser / AdminUser / SessionUser / OptionalAuthUser
 │   ├── idempotency.rs      # Scoped, Postgres-backed replay protection
 │   ├── metrics.rs          # MatchedPath route metrics + outermost outcome counter
 │   ├── rate_limit.rs       # Configurable limits and proxy-header trust
 │   └── security_headers.rs # CSP, Permissions-Policy, conditional HSTS
-├── models/                 # Request/response DTOs, row structs, pagination
-├── routes/                 # health + v1/{auth,users,files,notifications,realtime,audit}
+├── models/                 # Request/response DTOs, row structs, pagination, jobs, webhooks
+├── routes/                 # health + v1/{auth,users,files,notifications,realtime,audit,apps,webhooks}
 ├── services/
 │   ├── storage_backend/    # StorageBackend trait + local disk and S3 impls
 │   ├── api_key.rs          # M2M key issuance, scoped resolution, throttled last-use
 │   ├── audit.rs            # Append-only audit trail
 │   ├── auth.rs             # Argon2id, sessions, recovery tokens, lockout
+│   ├── job_queue.rs        # PostgreSQL SKIP LOCKED background job queue
 │   ├── mail.rs             # SMTP with TLS and credentials
 │   ├── notification.rs     # In-app notifications, published via pg_notify
 │   ├── oauth.rs            # OAuth2 + PKCE, server-side state validation
 │   ├── org.rs              # Apps, organizations, and OrgRole membership checks
 │   ├── realtime.rs         # LISTEN/NOTIFY bridge and publisher
-│   └── storage.rs          # StorageBackend trait, sniffing, signed URLs
+│   ├── storage.rs          # StorageBackend trait, sniffing, signed URLs
+│   └── webhook.rs          # Transactional outbox webhook dispatch & HMAC-SHA256 delivery
 ├── state/                  # AppState (pool, config, realtime channel, metrics)
 ├── lib.rs                  # OpenAPI declaration and app factory
-└── main.rs                 # Entrypoint: migrations, listener task, cleanup loop
+└── main.rs                 # Entrypoint: migrations, listener task, cleanup & job worker loop
 ```
 
 ---
@@ -350,7 +358,9 @@ Recorded so nobody mistakes absence for oversight.
   is a general permission grammar (`read("team:x:role")` applied uniformly to
   arbitrary resources) — authorization is currently expressed per resource in
   code. Adding a tenant-scoped table means writing its checks explicitly.
-- **Outbound webhooks.**
+- **External notification vendor SDKs (WhatsApp/Telegram/SMS/FCM).** Deliberately
+  rejected to preserve zero-bloat. Delivered via the outbox Webhooks dispatcher
+  to external serverless consumers (e.g. Cloudflare Worker or edge microservice).
 - **Per-tenant quotas, usage metering, and billing hooks.** Nothing counts or
   caps what an organization consumes.
 - **Dynamic collections and a functions runtime.** Deliberately rejected, not

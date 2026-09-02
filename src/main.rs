@@ -7,7 +7,10 @@ use tokio::signal;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use axum_template::{
-    config::AppConfig, create_app, services::realtime::RealtimeService, state::AppState,
+    config::AppConfig,
+    create_app,
+    services::{job_queue::JobQueueService, realtime::RealtimeService, webhook::WebhookService},
+    state::AppState,
 };
 
 #[tokio::main]
@@ -66,6 +69,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Reap expired idempotency keys, recovery tokens, and dead sessions.
     tokio::spawn(cleanup_loop(app_state.clone()));
+
+    // Background job worker loop: consumes SKIP LOCKED queue (e.g. webhook deliveries).
+    tokio::spawn(background_worker_loop(app_state.clone()));
 
     let app = create_app(app_state);
 
@@ -150,10 +156,107 @@ async fn cleanup_loop(state: Arc<AppState>) {
             }
         }
 
+        // Reap completed/failed background jobs older than 14 days
+        if let Ok(reaped) = JobQueueService::reap_old_jobs(&state.db, 14).await {
+            if reaped > 0 {
+                tracing::debug!(reaped_jobs = reaped, "Reaped old background jobs");
+            }
+        }
+
         // Presigned uploads that were reserved and never completed. This one
         // needs the storage backend as well as the database, so it cannot be
         // expressed as a plain statement above.
         reap_abandoned_uploads(&state).await;
+    }
+}
+
+/// Continuous background worker loop that polls and processes queued tasks.
+async fn background_worker_loop(state: Arc<AppState>) {
+    let worker_id = format!("worker-{}", uuid::Uuid::now_v7().simple());
+    let http_client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+
+    tracing::info!(worker_id = %worker_id, "Background job worker loop started");
+
+    loop {
+        // Poll for webhooks queue
+        match JobQueueService::poll_next_job(&state.db, "webhooks", &worker_id).await {
+            Ok(Some(job)) => {
+                if job.job_type == "webhook.deliver" {
+                    let delivery_id = job.payload["delivery_id"]
+                        .as_str()
+                        .and_then(|s| uuid::Uuid::parse_str(s).ok());
+                    let target_url = job.payload["target_url"].as_str();
+                    let secret = job.payload["secret"].as_str();
+                    let event_type = job.payload["event_type"].as_str();
+                    let payload = &job.payload["payload"];
+
+                    if let (Some(del_id), Some(url), Some(sec), Some(evt)) =
+                        (delivery_id, target_url, secret, event_type)
+                    {
+                        match WebhookService::execute_delivery(
+                            &state.db,
+                            &http_client,
+                            del_id,
+                            url,
+                            sec,
+                            evt,
+                            payload,
+                        )
+                        .await
+                        {
+                            Ok(true) => {
+                                let _ = JobQueueService::complete_job(&state.db, job.id).await;
+                                tracing::debug!(job_id = %job.id, delivery_id = %del_id, "Webhook delivered successfully");
+                            }
+                            Ok(false) => {
+                                let _ = JobQueueService::fail_job(
+                                    &state.db,
+                                    job.id,
+                                    job.attempts,
+                                    job.max_attempts,
+                                    "Delivery returned non-2xx HTTP status",
+                                )
+                                .await;
+                                tracing::warn!(job_id = %job.id, attempts = job.attempts, "Webhook delivery failed, scheduled retry");
+                            }
+                            Err(e) => {
+                                let _ = JobQueueService::fail_job(
+                                    &state.db,
+                                    job.id,
+                                    job.attempts,
+                                    job.max_attempts,
+                                    &e.to_string(),
+                                )
+                                .await;
+                                tracing::warn!(job_id = %job.id, error = %e, "Webhook delivery error, scheduled retry");
+                            }
+                        }
+                    } else {
+                        let _ = JobQueueService::fail_job(
+                            &state.db,
+                            job.id,
+                            job.max_attempts,
+                            job.max_attempts,
+                            "Malformed webhook delivery job payload",
+                        )
+                        .await;
+                    }
+                }
+                // Processed a job immediately: check next without sleeping
+                continue;
+            }
+            Ok(None) => {
+                // Queue idle: back off briefly
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "Background worker poll failed; sleeping before retry");
+                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+            }
+        }
     }
 }
 
