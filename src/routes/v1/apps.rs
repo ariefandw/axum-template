@@ -80,6 +80,43 @@ pub async fn list_apps(
     )))
 }
 
+#[utoipa::path(
+    get,
+    path = "/{app_id}",
+    operation_id = "get_app_details",
+    params(
+        ("app_id" = Uuid, Path, description = "Application ID")
+    ),
+    responses(
+        (status = 200, description = "Application details", body = ApiResponse<App>),
+        (status = 401, description = "Unauthorized", body = ApiErrorResponse),
+        (status = 403, description = "Forbidden: Caller does not have access to this app", body = ApiErrorResponse),
+        (status = 404, description = "Application not found", body = ApiErrorResponse)
+    ),
+    security(
+        ("bearer_auth" = [])
+    ),
+    tag = "Applications"
+)]
+pub async fn get_app_details(
+    app_ctx: crate::middleware::app_context::AppContext,
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<ApiResponse<App>>, AppError> {
+    let app = sqlx::query_as!(
+        App,
+        r#"
+        SELECT id, owner_id, name, slug, description, created_at, updated_at
+        FROM apps
+        WHERE id = $1
+        "#,
+        app_ctx.app_id
+    )
+    .fetch_one(&state.db)
+    .await?;
+
+    Ok(Json(ApiResponse::success(app)))
+}
+
 // =========================================================================
 // Organization Endpoints
 // =========================================================================
@@ -185,6 +222,7 @@ pub fn router() -> OpenApiRouter<Arc<AppState>> {
     OpenApiRouter::new()
         .routes(routes!(create_app))
         .routes(routes!(list_apps))
+        .routes(routes!(get_app_details))
         .routes(routes!(create_org))
         .routes(routes!(list_orgs))
         .routes(routes!(add_org_member))
