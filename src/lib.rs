@@ -89,8 +89,8 @@ use crate::{
         (name = "Notifications", description = "In-app notifications feed"),
         (name = "Realtime", description = "Server-Sent Events stream"),
         (name = "Audit", description = "Append-only compliance audit log"),
-        (name = "Social Login", description = "OAuth2 with PKCE (Google, GitHub)"),
-        (name = "Storage", description = "Owned file storage with signed URLs")
+        (name = "Storage", description = "Owned file storage with signed URLs"),
+        (name = "Webhooks", description = "Transactional outbox event webhooks")
     )
 )]
 pub struct ApiDoc;
