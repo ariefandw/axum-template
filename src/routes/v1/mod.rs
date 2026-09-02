@@ -10,6 +10,7 @@ pub mod files;
 pub mod notifications;
 pub mod realtime;
 pub mod users;
+pub mod webhooks;
 
 pub fn router(config: &AppConfig) -> OpenApiRouter<Arc<AppState>> {
     // Credential endpoints carry their own, much tighter bucket. Combined with
@@ -28,4 +29,5 @@ pub fn router(config: &AppConfig) -> OpenApiRouter<Arc<AppState>> {
         .nest("/notifications", notifications::router())
         .nest("/realtime", realtime::router())
         .nest("/audit-logs", audit::router())
+        .nest("/webhooks", webhooks::router())
 }
