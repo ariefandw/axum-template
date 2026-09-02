@@ -30,6 +30,8 @@ pub struct AppState {
     /// Where object bytes live. Selected once at startup from configuration, so
     /// no request path branches on the backend.
     pub storage: Arc<dyn StorageBackend>,
+    /// Optional remote JWKS verifier for OIDC / Better Auth external SSO tokens.
+    pub jwks_client: Option<Arc<crate::crypto::jwks::JwksClient>>,
 }
 
 impl AppState {
@@ -50,17 +52,29 @@ impl AppState {
             }
         };
 
+        let http_client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .user_agent(concat!("axum-template/", env!("CARGO_PKG_VERSION")))
+            .build()
+            .expect("Failed to build reqwest client");
+
+        let jwks_client = config.oidc.as_ref().map(|oidc| {
+            Arc::new(crate::crypto::jwks::JwksClient::new(
+                oidc.jwks_url.clone(),
+                oidc.expected_issuer.clone(),
+                oidc.expected_audience.clone(),
+                http_client.clone(),
+            ))
+        });
+
         Self {
             storage,
             db,
             config: Arc::new(config),
-            http_client: reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(10))
-                .user_agent(concat!("axum-template/", env!("CARGO_PKG_VERSION")))
-                .build()
-                .expect("Failed to build reqwest client"),
+            http_client,
             prometheus_handle: Arc::new(prometheus_handle),
             realtime_tx,
+            jwks_client,
         }
     }
 }

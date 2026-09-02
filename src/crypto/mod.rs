@@ -5,6 +5,8 @@
 //! of third-party credentials at rest, and a `Secret` wrapper that keeps
 //! credentials out of logs and `Debug` output.
 
+pub mod jwks;
+
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use chacha20poly1305::{
     ChaCha20Poly1305, Nonce,

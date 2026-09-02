@@ -22,6 +22,7 @@ use crate::{
 #[utoipa::path(
     post,
     path = "/create",
+    operation_id = "create_api_key",
     request_body = CreateApiKeyRequest,
     responses(
         (status = 201, description = "API key created successfully", body = ApiResponse<CreateApiKeyResponse>),
@@ -47,6 +48,7 @@ pub async fn create_api_key(
 #[utoipa::path(
     get,
     path = "/list",
+    operation_id = "list_api_keys",
     params(PageParams),
     responses(
         (status = 200, description = "List of API keys for the current user", body = ApiResponse<Vec<ApiKeyRecord>>),
@@ -74,6 +76,7 @@ pub async fn list_api_keys(
 #[utoipa::path(
     delete,
     path = "/{id}",
+    operation_id = "delete_api_key",
     params(
         ("id" = Uuid, Path, description = "API Key ID to revoke")
     ),

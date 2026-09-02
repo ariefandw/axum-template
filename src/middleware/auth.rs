@@ -31,14 +31,15 @@ use crate::{
 pub enum Credential {
     Session { session_id: Uuid },
     ApiKey { key_id: Uuid, scopes: ScopeSet },
+    SsoRemote { issuer: Option<String> },
 }
 
 impl Credential {
-    /// Authorize one capability. A session carries the account's full authority;
+    /// Authorize one capability. A session or external SSO token carries full authority;
     /// an API key carries only what it declared at creation.
     pub fn require_scope(&self, scope: ApiScope) -> Result<(), AppError> {
         match self {
-            Credential::Session { .. } => Ok(()),
+            Credential::Session { .. } | Credential::SsoRemote { .. } => Ok(()),
             Credential::ApiKey { scopes, .. } => {
                 if scopes.contains(scope) {
                     Ok(())
@@ -74,7 +75,7 @@ impl AuthUser {
     pub fn session_id(&self) -> Option<Uuid> {
         match self.credential {
             Credential::Session { session_id } => Some(session_id),
-            Credential::ApiKey { .. } => None,
+            Credential::ApiKey { .. } | Credential::SsoRemote { .. } => None,
         }
     }
 
@@ -169,26 +170,56 @@ where
         });
     }
 
-    // 2. Fall back to Bearer JWT access token
+    // 2. Bearer JWT: check local session token first, then fallback to remote JWKS SSO
     let token = bearer_token(parts)?;
-    let claims = AuthService::verify_access_token(token, state.config.jwt_secret.expose())?;
 
-    let user_id = Uuid::parse_str(&claims.sub)
-        .map_err(|_| AppError::Unauthorized("Malformed user ID in token".to_string()))?;
-    let session_id = Uuid::parse_str(&claims.sid)
-        .map_err(|_| AppError::Unauthorized("Malformed session ID in token".to_string()))?;
+    match AuthService::verify_access_token(token, state.config.jwt_secret.expose()) {
+        Ok(claims) => {
+            let user_id = Uuid::parse_str(&claims.sub)
+                .map_err(|_| AppError::Unauthorized("Malformed user ID in token".to_string()))?;
+            let session_id = Uuid::parse_str(&claims.sid)
+                .map_err(|_| AppError::Unauthorized("Malformed session ID in token".to_string()))?;
 
-    // Authoritative check: the session must still be live and the user must
-    // still be permitted. Role and ban state come from here, never the token.
-    let user = AuthService::resolve_session(&state.db, user_id, session_id).await?;
+            // Authoritative check: the session must still be live and the user must
+            // still be permitted. Role and ban state come from here, never the token.
+            let user = AuthService::resolve_session(&state.db, user_id, session_id).await?;
 
-    Ok(AuthUser {
-        id: user.id,
-        email: user.email,
-        role: user.role,
-        email_verified: user.email_verified,
-        credential: Credential::Session { session_id },
-    })
+            Ok(AuthUser {
+                id: user.id,
+                email: user.email,
+                role: user.role,
+                email_verified: user.email_verified,
+                credential: Credential::Session { session_id },
+            })
+        }
+        Err(local_err) => {
+            // If remote JWKS is configured, attempt validating token against external IdP (Better Auth / OIDC)
+            if let Some(jwks_client) = &state.jwks_client {
+                let remote_claims = jwks_client.verify_token(token).await?;
+
+                let user_id =
+                    Uuid::parse_str(&remote_claims.sub).unwrap_or_else(|_| Uuid::now_v7());
+
+                let email = remote_claims
+                    .email
+                    .unwrap_or_else(|| format!("{}@sso.local", user_id));
+                let role = remote_claims.role.unwrap_or_else(|| "member".to_string());
+                let email_verified = remote_claims.email_verified.unwrap_or(true);
+
+                Ok(AuthUser {
+                    id: user_id,
+                    email,
+                    role,
+                    email_verified,
+                    credential: Credential::SsoRemote {
+                        issuer: remote_claims.iss,
+                    },
+                })
+            } else {
+                Err(local_err)
+            }
+        }
+    }
 }
 
 impl<S> FromRequestParts<S> for AuthUser

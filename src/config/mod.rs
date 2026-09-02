@@ -91,6 +91,13 @@ pub struct OAuthProviderConfig {
     pub redirect_url: String,
 }
 
+#[derive(Clone, Debug)]
+pub struct OidcProviderConfig {
+    pub jwks_url: String,
+    pub expected_issuer: Option<String>,
+    pub expected_audience: Option<String>,
+}
+
 /// `Debug` is derived, and is safe: every secret-bearing field is a [`Secret`],
 /// and `encryption_key` is stored as raw bytes that are explicitly redacted.
 #[derive(Clone)]
@@ -143,6 +150,7 @@ pub struct AppConfig {
     pub smtp: Option<SmtpConfig>,
     pub google: Option<OAuthProviderConfig>,
     pub github: Option<OAuthProviderConfig>,
+    pub oidc: Option<OidcProviderConfig>,
 }
 
 impl std::fmt::Debug for AppConfig {
@@ -357,6 +365,12 @@ impl AppConfig {
         let google = oauth_provider("GOOGLE")?;
         let github = oauth_provider("GITHUB")?;
 
+        let oidc = opt_string("OIDC_JWKS_URL").map(|jwks_url| OidcProviderConfig {
+            jwks_url,
+            expected_issuer: opt_string("OIDC_ISSUER"),
+            expected_audience: opt_string("OIDC_AUDIENCE"),
+        });
+
         let allowed_upload_mime = opt_string("ALLOWED_UPLOAD_MIME")
             .map(|raw| {
                 raw.split(',')
@@ -415,6 +429,7 @@ impl AppConfig {
             smtp,
             google,
             github,
+            oidc,
         })
     }
 
@@ -477,6 +492,7 @@ impl AppConfig {
             smtp: None,
             google: None,
             github: None,
+            oidc: None,
         }
     }
 
