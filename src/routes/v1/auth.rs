@@ -257,7 +257,7 @@ pub async fn delete_user(
 #[utoipa::path(
     get, path = "/sign-in/social/google",
     responses((status = 200, description = "Google authorization URL", body = ApiResponse<OAuthUrlResponse>)),
-    tag = "Social Login"
+    tag = "Authentication"
 )]
 pub async fn google_auth(
     State(state): State<Arc<AppState>>,
@@ -277,7 +277,7 @@ pub async fn google_auth(
         (status = 200, description = "Signed in with Google", body = ApiResponse<AuthResponse>),
         (status = 401, description = "Invalid state or failed exchange", body = ApiErrorResponse)
     ),
-    tag = "Social Login"
+    tag = "Authentication"
 )]
 pub async fn google_callback(
     State(state): State<Arc<AppState>>,
@@ -291,7 +291,7 @@ pub async fn google_callback(
 #[utoipa::path(
     get, path = "/sign-in/social/github",
     responses((status = 200, description = "GitHub authorization URL", body = ApiResponse<OAuthUrlResponse>)),
-    tag = "Social Login"
+    tag = "Authentication"
 )]
 pub async fn github_auth(
     State(state): State<Arc<AppState>>,
@@ -311,7 +311,7 @@ pub async fn github_auth(
         (status = 200, description = "Signed in with GitHub", body = ApiResponse<AuthResponse>),
         (status = 401, description = "Invalid state or failed exchange", body = ApiErrorResponse)
     ),
-    tag = "Social Login"
+    tag = "Authentication"
 )]
 pub async fn github_callback(
     State(state): State<Arc<AppState>>,
