@@ -1,6 +1,7 @@
 pub mod api_key;
 pub mod audit;
 pub mod auth;
+pub mod job_queue;
 pub mod mail;
 pub mod notification;
 pub mod oauth;
