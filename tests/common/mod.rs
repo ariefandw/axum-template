@@ -205,7 +205,7 @@ impl TestApp {
         let (s, app) = self
             .post_as(
                 "/api/v1/apps",
-                serde_json::json!({ "name": "Test App", "slug": format!("app-{}", &n[..12]) }),
+                serde_json::json!({ "name": "Test App", "slug": format!("app-{}", &n[..16]) }),
                 token,
             )
             .await;
@@ -215,7 +215,7 @@ impl TestApp {
         let (s, org) = self
             .post_as(
                 &format!("/api/v1/apps/{app_id}/orgs"),
-                serde_json::json!({ "name": "Test Org", "slug": format!("org-{}", &n[..12]) }),
+                serde_json::json!({ "name": "Test Org", "slug": format!("org-{}", &n[..16]) }),
                 token,
             )
             .await;

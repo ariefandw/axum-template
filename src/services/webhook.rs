@@ -182,7 +182,7 @@ impl WebhookService {
             SELECT id, app_id, owner_id, org_id, target_url, secret, events, is_active, created_at, updated_at
             FROM webhooks
             WHERE is_active = true
-              AND ($1::uuid IS NULL OR app_id IS NULL OR app_id = $1)
+              AND ($1::uuid IS NULL AND app_id IS NULL OR app_id = $1)
               AND ($2::uuid IS NULL OR org_id IS NULL OR org_id = $2)
               AND ('*' = ANY(events) OR $3 = ANY(events))
             "#,

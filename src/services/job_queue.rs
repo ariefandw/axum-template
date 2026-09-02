@@ -29,19 +29,18 @@ impl JobQueueService {
 
         let id = Uuid::now_v7();
         let queue_name = queue.unwrap_or("default");
-        let scheduled_time = run_at.unwrap_or_else(Utc::now);
         let max_retries = max_attempts.unwrap_or(5);
 
         sqlx::query!(
             r#"
             INSERT INTO background_jobs (id, queue, job_type, payload, status, run_at, max_attempts)
-            VALUES ($1, $2, $3, $4, 'queued', $5, $6)
+            VALUES ($1, $2, $3, $4, 'queued', COALESCE($5, NOW()), $6)
             "#,
             id,
             queue_name,
             job_type,
             payload_json,
-            scheduled_time,
+            run_at,
             max_retries
         )
         .execute(pool)

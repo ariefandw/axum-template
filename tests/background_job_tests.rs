@@ -16,12 +16,14 @@ async fn job_queue_enqueue_and_poll_with_skip_locked() {
         "body": "Your account is ready."
     });
 
+    let queue_name = format!("mailer-{}", uuid::Uuid::now_v7().simple());
+
     // 1. Enqueue job
     let job_id = JobQueueService::enqueue(
         &app.state.db,
         "email.send",
         &payload,
-        Some("mailer"),
+        Some(&queue_name),
         None,
         Some(3),
     )
@@ -30,7 +32,7 @@ async fn job_queue_enqueue_and_poll_with_skip_locked() {
 
     // 2. Poll and lock job by Worker A
     let worker_a = "worker-node-1";
-    let polled = JobQueueService::poll_next_job(&app.state.db, "mailer", worker_a)
+    let polled = JobQueueService::poll_next_job(&app.state.db, &queue_name, worker_a)
         .await
         .expect("Polling failed")
         .expect("Job should be available");
@@ -42,7 +44,7 @@ async fn job_queue_enqueue_and_poll_with_skip_locked() {
 
     // 3. Worker B tries to poll while Worker A has it locked -> returns None (SKIP LOCKED)
     let worker_b = "worker-node-2";
-    let concurrent_poll = JobQueueService::poll_next_job(&app.state.db, "mailer", worker_b)
+    let concurrent_poll = JobQueueService::poll_next_job(&app.state.db, &queue_name, worker_b)
         .await
         .expect("Concurrent polling failed");
     assert!(
@@ -56,7 +58,7 @@ async fn job_queue_enqueue_and_poll_with_skip_locked() {
         .expect("Failed to complete job");
 
     // 5. Subsequent poll returns None because job is completed
-    let after_complete = JobQueueService::poll_next_job(&app.state.db, "mailer", worker_a)
+    let after_complete = JobQueueService::poll_next_job(&app.state.db, &queue_name, worker_a)
         .await
         .expect("Polling failed");
     assert!(after_complete.is_none());
@@ -68,11 +70,13 @@ async fn job_queue_exponential_backoff_and_retry() {
 
     let payload = json!({ "event": "webhook.dispatch" });
 
+    let queue_name = format!("webhooks-{}", uuid::Uuid::now_v7().simple());
+
     let job_id = JobQueueService::enqueue(
         &app.state.db,
         "webhook.retry",
         &payload,
-        Some("webhooks"),
+        Some(&queue_name),
         None,
         Some(2),
     )
@@ -80,7 +84,7 @@ async fn job_queue_exponential_backoff_and_retry() {
     .unwrap();
 
     // Poll attempt 1
-    let job = JobQueueService::poll_next_job(&app.state.db, "webhooks", "w1")
+    let job = JobQueueService::poll_next_job(&app.state.db, &queue_name, "w1")
         .await
         .unwrap()
         .unwrap();

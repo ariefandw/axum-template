@@ -56,9 +56,13 @@ async fn webhook_lifecycle_hmac_signature_and_delivery() {
 
     let target_url = format!("http://127.0.0.1:{}/mock-webhook", port);
 
-    // 2. Register Webhook via API
+    // 2. Register Webhook via API scoped to an app
+    let (app_id, _) = app.create_app_and_org(&token).await;
+    let app_uuid = uuid::Uuid::parse_str(&app_id).unwrap();
+
     let create_payload = json!({
         "target_url": target_url,
+        "app_id": app_uuid,
         "events": ["order.created", "user.banned"]
     });
 
@@ -73,10 +77,15 @@ async fn webhook_lifecycle_hmac_signature_and_delivery() {
 
     // 3. Dispatch an event
     let event_payload = json!({ "order_id": 12345, "total": 99.50 });
-    let dispatched =
-        WebhookService::dispatch_event(&app.state.db, "order.created", &event_payload, None, None)
-            .await
-            .expect("Dispatch failed");
+    let dispatched = WebhookService::dispatch_event(
+        &app.state.db,
+        "order.created",
+        &event_payload,
+        Some(app_uuid),
+        None,
+    )
+    .await
+    .expect("Dispatch failed");
 
     assert_eq!(dispatched, 1);
 
